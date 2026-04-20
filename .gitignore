@@ -1,0 +1,13 @@
+# Build outputs
+/bin/
+/prewarm
+*.test
+
+# Logs and runtime artifacts
+*.log
+*.log~
+prewarm_*.log
+reservation*.log
+
+# Editor / OS
+.DS_Store

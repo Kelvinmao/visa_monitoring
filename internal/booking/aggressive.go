@@ -1,0 +1,441 @@
+package booking
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"visa_monitor/internal/config"
+)
+
+type AggressiveClient struct {
+	cfg     *config.Config
+	workers []*aggressiveWorker
+	baseURL string
+}
+
+type aggressiveWorker struct {
+	id     int
+	client *http.Client
+	ready  bool
+}
+
+func NewAggressiveClient(cfg *config.Config, numWorkers int) *AggressiveClient {
+	// FIX: use domain directly so CookieJar domain matching works correctly.
+	// IP-based URLs cause Set-Cookie domain mismatches and sessions are never sent.
+	baseURL := cfg.BaseURL
+
+	sharedTransport := buildTransport()
+
+	workers := make([]*aggressiveWorker, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		jar, _ := NewThreadSafeJar()
+		workers[i] = &aggressiveWorker{
+			id: i,
+			client: &http.Client{
+				Jar:       jar,
+				Timeout:   30 * time.Second,
+				Transport: sharedTransport,
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			},
+		}
+	}
+
+	log.Printf("[AGGRESSIVE] Created %d workers → %s", numWorkers, baseURL)
+	return &AggressiveClient{
+		cfg:     cfg,
+		workers: workers,
+		baseURL: baseURL,
+	}
+}
+
+// WarmUp pre-establishes TCP+TLS connections for all workers in staggered batches.
+func (a *AggressiveClient) WarmUp() error {
+	const batchSize = 5
+	const batchDelay = 2 * time.Second
+	log.Printf("[WARMUP] Pre-warming %d connections (batch=%d)...", len(a.workers), batchSize)
+
+	var errCount int32
+
+	for i := 0; i < len(a.workers); i += batchSize {
+		end := i + batchSize
+		if end > len(a.workers) {
+			end = len(a.workers)
+		}
+
+		var wg sync.WaitGroup
+		for _, w := range a.workers[i:end] {
+			wg.Add(1)
+			go func(w *aggressiveWorker) {
+				defer wg.Done()
+				req, _ := http.NewRequest("GET", a.baseURL+"/reservations/calendar", nil)
+				req.Header.Set("User-Agent", userAgent)
+				resp, err := w.client.Do(req)
+				if err != nil {
+					atomic.AddInt32(&errCount, 1)
+					return
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}(w)
+		}
+		wg.Wait()
+
+		if end < len(a.workers) {
+			time.Sleep(batchDelay)
+		}
+	}
+
+	log.Printf("[WARMUP] Complete. Errors: %d/%d", errCount, len(a.workers))
+	return nil
+}
+
+// InitAllSessions initialises a session (CSRF token + calendar POST) for every
+// worker in staggered batches with retries.
+func (a *AggressiveClient) InitAllSessions(date string) error {
+	const batchSize = 5
+	const batchDelay = 2 * time.Second
+	const maxRetries = 3
+	const retryDelay = 5 * time.Second
+
+	log.Printf("[INIT] Initialising sessions for %d workers (batch=%d)...", len(a.workers), batchSize)
+
+	var readyCount int32
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			var pending []*aggressiveWorker
+			for _, w := range a.workers {
+				if !w.ready {
+					pending = append(pending, w)
+				}
+			}
+			if len(pending) == 0 {
+				break
+			}
+			log.Printf("[INIT] Retry %d/%d: %d workers pending, waiting %v...",
+				attempt, maxRetries-1, len(pending), retryDelay)
+			time.Sleep(retryDelay)
+		}
+
+		var pending []*aggressiveWorker
+		for _, w := range a.workers {
+			if !w.ready {
+				pending = append(pending, w)
+			}
+		}
+
+		for i := 0; i < len(pending); i += batchSize {
+			end := i + batchSize
+			if end > len(pending) {
+				end = len(pending)
+			}
+			batch := pending[i:end]
+
+			var wg sync.WaitGroup
+			for _, w := range batch {
+				wg.Add(1)
+				go func(w *aggressiveWorker) {
+					defer wg.Done()
+					if err := a.initWorkerSession(w, date); err != nil {
+						log.Printf("[Worker %d] Session init failed: %v", w.id, err)
+						return
+					}
+					w.ready = true
+					atomic.AddInt32(&readyCount, 1)
+				}(w)
+			}
+			wg.Wait()
+
+			if end < len(pending) {
+				time.Sleep(batchDelay)
+			}
+		}
+
+		log.Printf("[INIT] After attempt %d: %d/%d workers ready", attempt+1, readyCount, len(a.workers))
+	}
+
+	log.Printf("[INIT] Complete: %d/%d workers ready", readyCount, len(a.workers))
+
+	if readyCount == 0 {
+		return fmt.Errorf("all session inits failed")
+	}
+	return nil
+}
+
+func (a *AggressiveClient) initWorkerSession(w *aggressiveWorker, date string) error {
+	// Step 1: get CSRF token
+	req, _ := http.NewRequest("GET", a.baseURL+"/reservations/calendar", nil)
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	csrfMatch := reCsrfValue.FindStringSubmatch(string(body))
+	if len(csrfMatch) < 2 {
+		return fmt.Errorf("no CSRF token")
+	}
+
+	// Step 2: set session via calendar POST
+	formData := url.Values{}
+	formData.Set("event", a.cfg.EventID)
+	formData.Set("plan", a.cfg.PlanID)
+	formData.Set("date", date)
+	formData.Set("disp_type", "day")
+	formData.Set("search", "exec")
+	formData.Set("_csrfToken", csrfMatch[1])
+
+	req2, _ := http.NewRequest("POST", a.baseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req2.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req2.Header.Set("User-Agent", userAgent)
+
+	resp2, err := w.client.Do(req2)
+	if err != nil {
+		return err
+	}
+	resp2.Body.Close()
+	return nil
+}
+
+// BurstBook spawns one goroutine per ready worker, each hammering its assigned
+// time slot until a booking succeeds or the 5-minute window expires.
+// FIX: each goroutine uses a FIXED worker (not round-robin) so session cookies
+// are never mixed between workers.
+func (a *AggressiveClient) BurstBook(date string, _ int) *Result {
+	slots := GetTimeSlots()
+	results := make(chan *Result, 1)
+	var stopFlag int32
+	var wg sync.WaitGroup
+
+	readyWorkers := 0
+	for _, w := range a.workers {
+		if !w.ready {
+			continue
+		}
+		readyWorkers++
+	}
+	log.Printf("[BURST] Starting with %d ready workers, %d slots", readyWorkers, len(slots))
+
+	for i, w := range a.workers {
+		if !w.ready {
+			continue
+		}
+		slot := slots[i%len(slots)]
+		wg.Add(1)
+		go func(w *aggressiveWorker, slot string) {
+			defer wg.Done()
+			a.workerLoop(w, date, slot, results, &stopFlag)
+		}(w, slot)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	select {
+	case result, ok := <-results:
+		atomic.StoreInt32(&stopFlag, 1)
+		if ok {
+			return result
+		}
+		return &Result{Success: false, Message: "All workers exited"}
+	case <-time.After(5 * time.Minute):
+		atomic.StoreInt32(&stopFlag, 1)
+		return &Result{Success: false, Message: "Timeout"}
+	}
+}
+
+func (a *AggressiveClient) workerLoop(w *aggressiveWorker, date, timeSlot string, results chan<- *Result, stopFlag *int32) {
+	optionURL := fmt.Sprintf("%s/reservations/option?event_id=%s&event_plan_id=%s&date=%s&time_from=%s",
+		a.baseURL, a.cfg.EventID, a.cfg.PlanID, url.QueryEscape(date), url.QueryEscape(timeSlot))
+
+	for {
+		if atomic.LoadInt32(stopFlag) == 1 {
+			return
+		}
+
+		req, _ := http.NewRequest("GET", optionURL, nil)
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Referer", a.baseURL+"/reservations/calendar")
+
+		resp, err := w.client.Do(req)
+		if err != nil {
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+
+		if resp.StatusCode == 200 {
+			// Slot available — option page loaded, proceed to guest
+			resp.Body.Close()
+			guestURL := a.baseURL + "/reservations/user/guest"
+			result := a.submitBooking(w.client, guestURL, timeSlot)
+			if result.Success {
+				select {
+				case results <- result:
+				default:
+				}
+				return
+			}
+		} else if resp.StatusCode == 302 {
+			location := resp.Header.Get("Location")
+			resp.Body.Close()
+
+			if strings.Contains(location, "/guest") || strings.Contains(location, "/user/guest") {
+				result := a.submitBooking(w.client, location, timeSlot)
+				if result.Success {
+					select {
+					case results <- result:
+					default:
+					}
+					return
+				}
+			} else {
+				time.Sleep(5 * time.Millisecond)
+			}
+		} else {
+			resp.Body.Close()
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+}
+
+func (a *AggressiveClient) submitBooking(client *http.Client, guestURL, timeSlot string) *Result {
+	if !strings.HasPrefix(guestURL, "http") {
+		guestURL = a.baseURL + guestURL
+	}
+
+	req, _ := http.NewRequest("GET", guestURL, nil)
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return &Result{Success: false, Message: "Guest page failed"}
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	tokenCsrf, tokenFields, tokenUnlocked := extractFormTokens(string(body))
+
+	// FIX: use SplitPhone from config instead of hard-coded digits
+	parts := SplitPhone(a.cfg.Phone)
+
+	formData := url.Values{}
+	formData.Set("_method", "POST")
+	formData.Set("_csrfToken", tokenCsrf)
+	formData.Set("users[addition_values][4][0]", a.cfg.FamilyName)
+	formData.Set("users[addition_values][4][1]", a.cfg.FirstName)
+	formData.Set("users[addition_values][6][0]", parts[0])
+	formData.Set("users[addition_values][6][1]", parts[1])
+	formData.Set("users[addition_values][6][2]", parts[2])
+	formData.Set("users[addition_values][16]", "")
+	formData.Set("users[addition_values][17]", "")
+	formData.Set("users[mail]", a.cfg.Email)
+	formData.Set("users[mail_confirm]", a.cfg.Email)
+	formData.Set("_Token[fields]", tokenFields)
+	formData.Set("_Token[unlocked]", tokenUnlocked)
+
+	req2, _ := http.NewRequest("POST", guestURL, strings.NewReader(formData.Encode()))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req2.Header.Set("User-Agent", userAgent)
+	req2.Header.Set("Origin", a.baseURL)
+	req2.Header.Set("Referer", guestURL)
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		return &Result{Success: false, Message: "Submit failed"}
+	}
+	resp2.Body.Close()
+
+	if resp2.StatusCode == 302 {
+		return a.confirmBooking(client, timeSlot)
+	}
+	return &Result{Success: false, Message: fmt.Sprintf("Submit status: %d", resp2.StatusCode)}
+}
+
+func (a *AggressiveClient) confirmBooking(client *http.Client, timeSlot string) *Result {
+	req, _ := http.NewRequest("GET", a.baseURL+"/reservations/conf", nil)
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return &Result{Success: false, Message: "Conf page failed"}
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	tokenCsrf, tokenFields, _ := extractFormTokens(string(body))
+
+	formData := url.Values{}
+	formData.Set("_method", "POST")
+	formData.Set("_csrfToken", tokenCsrf)
+	formData.Set("_Token[fields]", tokenFields)
+
+	req2, _ := http.NewRequest("POST", a.baseURL+"/reservations/conf", strings.NewReader(formData.Encode()))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req2.Header.Set("User-Agent", userAgent)
+	req2.Header.Set("Origin", a.baseURL)
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		return &Result{Success: false, Message: "Confirm failed"}
+	}
+	resp2.Body.Close()
+
+	if resp2.StatusCode == 302 {
+		location := resp2.Header.Get("Location")
+		if strings.Contains(location, "/finish/") {
+			return &Result{Success: true, TimeSlot: timeSlot, Message: "Booked! " + location}
+		}
+	}
+	return &Result{Success: false, Message: fmt.Sprintf("Confirm status: %d", resp2.StatusCode)}
+}
+
+// ThreadSafeJar is a simple thread-safe cookie jar.
+type ThreadSafeJar struct {
+	mu    sync.RWMutex
+	store map[string][]*http.Cookie
+}
+
+func NewThreadSafeJar() (*ThreadSafeJar, error) {
+	return &ThreadSafeJar{store: make(map[string][]*http.Cookie)}, nil
+}
+
+func (j *ThreadSafeJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	existing := j.store[u.Host]
+	for _, c := range cookies {
+		replaced := false
+		for i, e := range existing {
+			if e.Name == c.Name {
+				existing[i] = c
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			existing = append(existing, c)
+		}
+	}
+	j.store[u.Host] = existing
+}
+
+func (j *ThreadSafeJar) Cookies(u *url.URL) []*http.Cookie {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.store[u.Host]
+}

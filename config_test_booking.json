@@ -1,0 +1,11 @@
+{
+  "target_date": "2026/05/01",
+  "event_id": "14",
+  "plan_id": "1",
+  "family_name": "Test",
+  "first_name": "Booking",
+  "phone": "825-984-7284",
+  "email": "kelvinmao7@gmail.com",
+  "burst_duration_min": 1,
+  "worker_count": 3
+}
