@@ -132,13 +132,14 @@ func main() {
 	log.Printf("ReleaseTime:       %s (in ~%ds)", releaseAt.Format("15:04:05.000"), *releaseDelay)
 	log.Printf("========================================")
 
-	// Schedule competitor grabs
+	// Schedule competitor grabs - simulates hundreds of bots racing at exact release moment
 	go func() {
 		delay := time.Duration(scenario.CompetitorDelayMs) * time.Millisecond
 		time.Sleep(delay)
 		slotsMu.Lock()
 		totalTaken := 0
 		remaining := scenario.CompetitorGrab
+		// Distribute competitors across slots proportionally
 		for slotName, slot := range slots {
 			if remaining <= 0 {
 				break
@@ -147,7 +148,8 @@ func main() {
 			if available <= 0 {
 				continue
 			}
-			grabbed := remaining / (len(slots) - totalTaken)
+			// Each slot gets fair share of competitors
+			grabbed := remaining / (len(slots))
 			if grabbed > available {
 				grabbed = available
 			}
