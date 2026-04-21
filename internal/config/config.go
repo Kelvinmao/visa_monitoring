@@ -120,9 +120,18 @@ func (c *Config) GetTargetDateTime() time.Time {
 	return t
 }
 
+func releaseLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		return time.FixedZone("JST", 9*60*60)
+	}
+	return loc
+}
+
 func (c *Config) GetNextReleaseTime() time.Time {
-	now := time.Now()
-	target := time.Date(now.Year(), now.Month(), now.Day(), c.ReleaseHour, c.ReleaseMinute, 0, 0, now.Location())
+	loc := releaseLocation()
+	now := time.Now().In(loc)
+	target := time.Date(now.Year(), now.Month(), now.Day(), c.ReleaseHour, c.ReleaseMinute, 0, 0, loc)
 	gracePeriod := time.Duration(c.StartEarlySec+30) * time.Second
 	if now.After(target.Add(gracePeriod)) {
 		target = target.AddDate(0, 0, 1)

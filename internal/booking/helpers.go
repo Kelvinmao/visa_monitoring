@@ -28,8 +28,7 @@ func buildTransport() *http.Transport {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     60 * time.Second,
-		DisableCompression:  true,
-		ForceAttemptHTTP2:   false,
+		ForceAttemptHTTP2:   true,
 	}
 }
 

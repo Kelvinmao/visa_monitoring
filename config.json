@@ -1,5 +1,5 @@
 {
-  "target_date": "2026/06/24",
+  "target_date": "2026/06/25",
   "event_id": "16",
   "plan_id": "20",
   "family_name": "Mao",
@@ -8,7 +8,7 @@
   "email": "kaining@layer6.ai",
   "release_hour": 9,
   "release_minute": 0,
-  "start_early_sec": 5,
+  "start_early_sec": 30,
   "burst_duration_min": 10,
-  "worker_count": 50
+  "worker_count": 200
 }

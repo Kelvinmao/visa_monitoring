@@ -257,7 +257,7 @@ func (c *Client) Book(date, timeSlot string) *Result {
 
 	log.Printf("[DEBUG] Option response status: %d", resp.StatusCode)
 
-	if resp.StatusCode != 200 && resp.StatusCode < 300 || resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		log.Printf("[DEBUG] Option error response: %s", string(bodyBytes)[:min(500, len(bodyBytes))])

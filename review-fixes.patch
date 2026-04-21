@@ -1,0 +1,119 @@
+diff --git a/cmd/prewarm/main.go b/cmd/prewarm/main.go
+index e77449d..e1124ec 100644
+--- a/cmd/prewarm/main.go
++++ b/cmd/prewarm/main.go
+@@ -68,18 +68,32 @@ func main() {
+         keepAliveStop := make(chan struct{})
+         go client.KeepAlive(keepAliveStop)
+ 
+-        // No clock offset calculation — just start early and let rapid retries
+-        // naturally cover the opening moment. "受付期間外" rejections are fast (~100ms),
+-        // so 50 workers × ~10 retries/sec = ~500 req/sec carpet-bombing the transition.
+-        burstStart := releaseTime.Add(-time.Duration(cfg.StartEarlySec) * time.Second)
+-        log.Printf("[MAIN] Burst scheduled at local %s (release=%s, early=%ds)",
++        // Calibrate the server→local clock offset using a burst of HEAD samples.
++        // HTTP Date header has 1s resolution, so multi-sample max + correction
++        // gets us within a few hundred ms of true server time.
++        log.Printf("[MAIN] Calibrating server clock...")
++        booking.CalibrateServerClock(cfg.BaseURL, 30)
++        clockOffset := booking.GetServerClockOffset()
++        log.Printf("[MAIN] Server clock offset: %v (server is %s vs local)",
++                clockOffset.Round(time.Millisecond),
++                map[bool]string{true: "AHEAD", false: "BEHIND"}[clockOffset > 0])
++
++        // burstStart is in LOCAL clock terms but anchored to SERVER release time.
++        // If server is ahead of local by +Xs, we must fire X seconds earlier (locally)
++        // to land at the same instant on the server.
++        burstStart := releaseTime.
++                Add(-time.Duration(cfg.StartEarlySec) * time.Second).
++                Add(-clockOffset)
++        log.Printf("[MAIN] Burst scheduled at local %s (release=%s JST, early=%ds, clock_adj=%v)",
+                 burstStart.Format("15:04:05.000"), releaseTime.Format("15:04:05"),
+-                cfg.StartEarlySec)
++                cfg.StartEarlySec, clockOffset.Round(time.Millisecond))
+         log.Printf("[MAIN] Strategy: start %ds early, rapid-retry on 受付期間外 until server opens",
+                 cfg.StartEarlySec)
+ 
+-        // Stop keepalive 10 seconds before burst to let connections settle.
+-        keepAliveDeadline := burstStart.Add(-10 * time.Second)
++        // Stop keepalive 2 seconds before burst. The shorter gap keeps the TCP/TLS
++        // connection pool hot — long idle gaps risk the server closing keep-alive
++        // sockets, forcing fresh handshakes exactly when latency matters most.
++        keepAliveDeadline := burstStart.Add(-2 * time.Second)
+ 
+         // Wait until close to burst time.
+         for time.Now().Before(keepAliveDeadline) {
+@@ -90,11 +104,10 @@ func main() {
+                 time.Sleep(1 * time.Second)
+         }
+ 
+-        // Stop keepalive now and wait for it to fully drain.
++        // Stop keepalive now. Don't sleep — we want minimal idle time before burst.
+         close(keepAliveStop)
+-        log.Printf("[MAIN] KeepAlive stopped at %s (%.1fs before burst)",
++        log.Printf("[MAIN] KeepAlive stopped at %s (%.3fs before burst)",
+                 time.Now().Format("15:04:05.000"), time.Until(burstStart).Seconds())
+-        time.Sleep(3 * time.Second) // let in-flight keepalive requests complete
+ 
+         // Probe slots before burst to verify session validity
+         log.Printf("[MAIN] Probing slots to verify session...")
+diff --git a/internal/booking/booking.go b/internal/booking/booking.go
+index c54842a..a465d96 100644
+--- a/internal/booking/booking.go
++++ b/internal/booking/booking.go
+@@ -257,7 +257,9 @@ func (c *Client) Book(date, timeSlot string) *Result {
+ 
+         log.Printf("[DEBUG] Option response status: %d", resp.StatusCode)
+ 
+-        if resp.StatusCode != 200 && resp.StatusCode < 300 || resp.StatusCode >= 400 {
++        // Treat anything outside 2xx/3xx as an error. 3xx is the expected
++        // redirect path to the guest page and must NOT be classified as failure.
++        if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+                 bodyBytes, _ := io.ReadAll(resp.Body)
+                 resp.Body.Close()
+                 log.Printf("[DEBUG] Option error response: %s", string(bodyBytes)[:min(500, len(bodyBytes))])
+diff --git a/internal/booking/helpers.go b/internal/booking/helpers.go
+index 0c5bbc8..d60b10a 100644
+--- a/internal/booking/helpers.go
++++ b/internal/booking/helpers.go
+@@ -28,8 +28,9 @@ func buildTransport() *http.Transport {
+                 MaxIdleConns:        100,
+                 MaxIdleConnsPerHost: 100,
+                 IdleConnTimeout:     60 * time.Second,
+-                DisableCompression:  true,
+-                ForceAttemptHTTP2:   false,
++                // HTTP/2 multiplexes many concurrent requests over a couple of TCP
++                // connections, dramatically lowering per-request latency under burst load.
++                ForceAttemptHTTP2: true,
+         }
+ }
+ 
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 729eca7..793482e 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -120,9 +120,22 @@ func (c *Config) GetTargetDateTime() time.Time {
+         return t
+ }
+ 
++// releaseLocation pins the release time to JST. The target server
++// (toronto.rsvsys.jp) operates in Asia/Tokyo, so ReleaseHour/Minute are
++// always interpreted as JST regardless of the host's local timezone.
++func releaseLocation() *time.Location {
++        loc, err := time.LoadLocation("Asia/Tokyo")
++        if err != nil {
++                // Fallback: fixed +09:00 if tzdata is unavailable on the host.
++                return time.FixedZone("JST", 9*3600)
++        }
++        return loc
++}
++
+ func (c *Config) GetNextReleaseTime() time.Time {
+-        now := time.Now()
+-        target := time.Date(now.Year(), now.Month(), now.Day(), c.ReleaseHour, c.ReleaseMinute, 0, 0, now.Location())
++        loc := releaseLocation()
++        now := time.Now().In(loc)
++        target := time.Date(now.Year(), now.Month(), now.Day(), c.ReleaseHour, c.ReleaseMinute, 0, 0, loc)
+         gracePeriod := time.Duration(c.StartEarlySec+30) * time.Second
+         if now.After(target.Add(gracePeriod)) {
+                 target = target.AddDate(0, 0, 1)

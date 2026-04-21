@@ -68,18 +68,23 @@ func main() {
 	keepAliveStop := make(chan struct{})
 	go client.KeepAlive(keepAliveStop)
 
-	// No clock offset calculation — just start early and let rapid retries
-	// naturally cover the opening moment. "受付期間外" rejections are fast (~100ms),
-	// so 50 workers × ~10 retries/sec = ~500 req/sec carpet-bombing the transition.
-	burstStart := releaseTime.Add(-time.Duration(cfg.StartEarlySec) * time.Second)
-	log.Printf("[MAIN] Burst scheduled at local %s (release=%s, early=%ds)",
+	log.Printf("[MAIN] Calibrating server clock....")
+	booking.CalibrateServerClock(cfg.BaseURL, 30)
+	clockOffset := booking.GetServerClockOffset()
+	log.Printf("[MAIN] Server clock offset: %v (server is %s vs local)",
+		clockOffset.Round(time.Millisecond),
+		map[bool]string{true: "ahead", false: "behind"}[clockOffset > 0])
+	
+	burstStart := releaseTime.
+		Add(-time.Duration(cfg.StartEarlySec) * time.Second).
+		Add(-clockOffset) // compensate for server clock offset
+	log.Printf("[MAIN] Burst scheduled for %s (release at %s JST, starting %ds early, clock_adj=%v)",
 		burstStart.Format("15:04:05.000"), releaseTime.Format("15:04:05"),
-		cfg.StartEarlySec)
+		cfg.StartEarlySec, clockOffset.Round(time.Millisecond))
 	log.Printf("[MAIN] Strategy: start %ds early, rapid-retry on 受付期間外 until server opens",
 		cfg.StartEarlySec)
 
-	// Stop keepalive 10 seconds before burst to let connections settle.
-	keepAliveDeadline := burstStart.Add(-10 * time.Second)
+	keepAliveDeadline := burstStart.Add(-2 * time.Second) // stop keepalive 2s before burst
 
 	// Wait until close to burst time.
 	for time.Now().Before(keepAliveDeadline) {
@@ -92,9 +97,8 @@ func main() {
 
 	// Stop keepalive now and wait for it to fully drain.
 	close(keepAliveStop)
-	log.Printf("[MAIN] KeepAlive stopped at %s (%.1fs before burst)",
+	log.Printf("[MAIN] KeepAlive stopped at %s (%.3fs before burst)",
 		time.Now().Format("15:04:05.000"), time.Until(burstStart).Seconds())
-	time.Sleep(3 * time.Second) // let in-flight keepalive requests complete
 
 	// Probe slots before burst to verify session validity
 	log.Printf("[MAIN] Probing slots to verify session...")
