@@ -1,0 +1,9 @@
+{
+  "slot_capacity": 3,
+  "competitor_grab": 3,
+  "competitor_delay_ms": 0,
+  "cancel_after_sec": 15,
+  "cancel_count": 2,
+  "server_latency_ms": 80,
+  "enforce_release_time": true
+}
