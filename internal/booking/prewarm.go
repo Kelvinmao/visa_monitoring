@@ -136,7 +136,7 @@ func NewPreWarmClient(cfg *config.Config, numWorkers int) *PreWarmClient {
 			id: i,
 			client: &http.Client{
 				Jar:       jar,
-				Timeout:   60 * time.Second,
+				Timeout:   10 * time.Second,
 				Transport: sharedTransport,
 				CheckRedirect: func(req *http.Request, via []*http.Request) error {
 					return http.ErrUseLastResponse
@@ -452,7 +452,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				optionURL := fmt.Sprintf("%s/reservations/option?event_id=%s&event_plan_id=%s&date=%s&time_from=%s",
 					p.baseURL, p.cfg.EventID, p.cfg.PlanID, url.QueryEscape(date), url.QueryEscape(mySlot))
 
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				req, _ := http.NewRequestWithContext(ctx, "GET", optionURL, nil)
 				req.Header.Set("User-Agent", userAgent)
 				req.Header.Set("Referer", p.baseURL+"/reservations/calendar")

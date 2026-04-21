@@ -74,7 +74,7 @@ func main() {
 	log.Printf("[MAIN] Server clock offset: %v (server is %s vs local)",
 		clockOffset.Round(time.Millisecond),
 		map[bool]string{true: "ahead", false: "behind"}[clockOffset > 0])
-	
+
 	burstStart := releaseTime.
 		Add(-time.Duration(cfg.StartEarlySec) * time.Second).
 		Add(-clockOffset) // compensate for server clock offset
@@ -84,7 +84,7 @@ func main() {
 	log.Printf("[MAIN] Strategy: start %ds early, rapid-retry on 受付期間外 until server opens",
 		cfg.StartEarlySec)
 
-	keepAliveDeadline := burstStart.Add(-2 * time.Second) // stop keepalive 2s before burst
+	keepAliveDeadline := burstStart.Add(-1 * time.Second) // stop keepalive 1s before burst
 
 	// Wait until close to burst time.
 	for time.Now().Before(keepAliveDeadline) {
