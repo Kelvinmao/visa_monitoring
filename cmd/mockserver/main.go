@@ -1,12 +1,13 @@
 package main
 
 import (
-	"crypto/rand"
+	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -74,7 +75,7 @@ type SlotState struct {
 
 func randomToken() string {
 	b := make([]byte, 32)
-	rand.Read(b)
+	crand.Read(b)
 	return hex.EncodeToString(b)
 }
 
@@ -132,41 +133,101 @@ func main() {
 	log.Printf("ReleaseTime:       %s (in ~%ds)", releaseAt.Format("15:04:05.000"), *releaseDelay)
 	log.Printf("========================================")
 
-	// Schedule competitor grabs - simulates hundreds of bots racing at exact release moment
+	// Schedule competitors as actual HTTP clients with realistic delays.
+	// Each competitor makes a GET request to /reservations/option just like our bot.
+	// Their network delay determines when their request arrives at the server.
+	// The server processes requests in arrival order - first come first served.
 	go func() {
-		delay := time.Duration(scenario.CompetitorDelayMs) * time.Millisecond
-		time.Sleep(delay)
+		totalCompetitors := scenario.CompetitorGrab
+		if totalCompetitors <= 0 {
+			return
+		}
+		perSlot := totalCompetitors / len(slots)
+		if perSlot == 0 {
+			perSlot = 1
+		}
+
+		// Create HTTP clients for competitors
+		competitorTransport := &http.Transport{
+			MaxIdleConns:        totalCompetitors,
+			MaxIdleConnsPerHost: totalCompetitors,
+			MaxConnsPerHost:     totalCompetitors,
+		}
+
+		competitorID := 0
+		tierCounts := map[string]int{"fast": 0, "tokyo": 0, "regional": 0, "slow": 0}
+
+		for slotName := range slots {
+			for i := 0; i < perSlot; i++ {
+				var networkDelay time.Duration
+				r := rand.Intn(100)
+				switch {
+				case r < 2: // Tier 1: super fast bots (2%) - 5-15ms
+					networkDelay = time.Duration(5+rand.Intn(10)) * time.Millisecond
+					tierCounts["fast"]++
+				case r < 15: // Tier 2: tokyo bots (13%) - 20-80ms
+					networkDelay = time.Duration(20+rand.Intn(60)) * time.Millisecond
+					tierCounts["tokyo"]++
+				case r < 60: // Tier 3: regional (45%) - 100-400ms
+					networkDelay = time.Duration(100+rand.Intn(300)) * time.Millisecond
+					tierCounts["regional"]++
+				default: // Tier 4: slow (40%) - 400-1000ms
+					networkDelay = time.Duration(400+rand.Intn(600)) * time.Millisecond
+					tierCounts["slow"]++
+				}
+
+				cid := competitorID
+				competitorID++
+
+				go func(slot string, delay time.Duration, id int) {
+					time.Sleep(delay)
+
+					// Competitor hits the option endpoint just like our bot
+					optionURL := fmt.Sprintf("http://127.0.0.1:%d/reservations/option?event_id=16&event_plan_id=20&date=2026%%2F06%%2F25&time_from=%s",
+						*port, slot)
+					client := &http.Client{
+						Transport: competitorTransport,
+						CheckRedirect: func(req *http.Request, via []*http.Request) error {
+							return http.ErrUseLastResponse
+						},
+						Timeout: 5 * time.Second,
+					}
+
+					req, _ := http.NewRequest("GET", optionURL, nil)
+					req.Header.Set("User-Agent", fmt.Sprintf("CompetitorBot/%d", id))
+
+					resp, err := client.Do(req)
+					if err != nil {
+						return
+					}
+					defer resp.Body.Close()
+
+					// If they got a 200 or 302, they successfully claimed a slot
+					if resp.StatusCode == 200 || resp.StatusCode == 302 {
+						// Mark the slot as taken in our tracking
+						slotsMu.Lock()
+						if s, ok := slots[slot]; ok && s.taken < s.capacity {
+							// Slot was available when this request arrived
+						}
+						slotsMu.Unlock()
+					}
+				}(slotName, networkDelay, cid)
+			}
+		}
+
+		log.Printf("[COMPETITORS] %d total competitors scheduled", totalCompetitors)
+		log.Printf("[COMPETITORS] Tier 1 (fast <20ms): %d", tierCounts["fast"])
+		log.Printf("[COMPETITORS] Tier 2 (tokyo <100ms): %d", tierCounts["tokyo"])
+		log.Printf("[COMPETITORS] Tier 3 (regional <400ms): %d", tierCounts["regional"])
+		log.Printf("[COMPETITORS] Tier 4 (slow >=400ms): %d", tierCounts["slow"])
+
+		// Wait for all competitors to finish
+		time.Sleep(1200 * time.Millisecond)
 		slotsMu.Lock()
-		totalTaken := 0
-		remaining := scenario.CompetitorGrab
-		// Distribute competitors across slots proportionally
 		for slotName, slot := range slots {
-			if remaining <= 0 {
-				break
-			}
-			available := slot.capacity - slot.taken
-			if available <= 0 {
-				continue
-			}
-			// Each slot gets fair share of competitors
-			grabbed := remaining / (len(slots))
-			if grabbed > available {
-				grabbed = available
-			}
-			if grabbed <= 0 {
-				grabbed = 1
-			}
-			if grabbed > remaining {
-				grabbed = remaining
-			}
-			slot.taken += grabbed
-			remaining -= grabbed
-			totalTaken += grabbed
-			log.Printf("[COMPETITOR] Slot %s: %d/%d taken by competitors",
-				slotName, slot.taken, slot.capacity)
+			log.Printf("[COMPETITORS] Slot %s: %d/%d taken by competitors", slotName, slot.taken, slot.capacity)
 		}
 		slotsMu.Unlock()
-		log.Printf("[COMPETITOR] Total %d slots grabbed across all time slots", totalTaken)
 	}()
 
 	// Schedule cancellations
@@ -282,14 +343,6 @@ func handleOption(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&totalRequests, 1)
 	addLatency()
 
-	sess := getSession(r)
-	if sess == nil {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	timeFrom := r.URL.Query().Get("time_from")
-
 	// Check release time
 	if scenario.EnforceReleaseTime && time.Now().Before(releaseAt) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -301,6 +354,7 @@ func handleOption(w http.ResponseWriter, r *http.Request) {
 
 	// Check slot capacity
 	slotsMu.Lock()
+	timeFrom := r.URL.Query().Get("time_from")
 	slot, ok := slots[timeFrom]
 	if !ok {
 		slotsMu.Unlock()
