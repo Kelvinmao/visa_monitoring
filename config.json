@@ -9,6 +9,6 @@
   "release_hour": 9,
   "release_minute": 0,
   "start_early_sec": 30,
-  "burst_duration_min": 10,
+  "burst_duration_min": 30,
   "worker_count": 200
 }

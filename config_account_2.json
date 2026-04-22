@@ -9,7 +9,7 @@
   "release_hour": 12,
   "release_minute": 9,
   "start_early_sec": 30,
-  "burst_duration_min": 3,
+  "burst_duration_min": 30,
   "worker_count": 100,
   "base_url": "http://127.0.0.1:9876"
 }

@@ -398,6 +398,40 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 	fullRotationsWithoutHit := int64(0)
 	const minPerSlotForExit = 20 // require >=20 capacity-full per slot before considering exit
 
+	// All-slots-full detection for fast cancellation mode
+	var allSlotsFullSince time.Time
+	var allSlotsFullMu sync.Mutex
+
+	// Background session keepalive during burst
+	keepAliveCtx, keepAliveCancel := context.WithCancel(context.Background())
+	defer keepAliveCancel()
+	go func() {
+		ticker := time.NewTicker(45 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepAliveCtx.Done():
+				return
+			case <-ticker.C:
+				// Quick keepalive: just hit calendar page
+				for _, w := range p.clients {
+					if w.csrfToken == "" {
+						continue
+					}
+					req, _ := http.NewRequest("GET", p.baseURL+"/reservations/calendar", nil)
+					req.Header.Set("User-Agent", userAgent)
+					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					resp, err := w.client.Do(req.WithContext(ctx))
+					cancel()
+					if err == nil && resp != nil {
+						io.Copy(io.Discard, resp.Body)
+						resp.Body.Close()
+					}
+				}
+			}
+		}
+	}()
+
 	firstProfiles := make([]firstReqProfile, len(p.clients))
 
 	quickBurstStart := time.Now()
@@ -452,7 +486,16 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				optionURL := fmt.Sprintf("%s/reservations/option?event_id=%s&event_plan_id=%s&date=%s&time_from=%s",
 					p.baseURL, p.cfg.EventID, p.cfg.PlanID, url.QueryEscape(date), url.QueryEscape(mySlot))
 
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				// Use shorter timeout in cancellation mode for faster cycling
+				reqTimeout := 2 * time.Second
+				allSlotsFullMu.Lock()
+				inCancelMode := !allSlotsFullSince.IsZero() && time.Since(allSlotsFullSince) > 30*time.Second
+				allSlotsFullMu.Unlock()
+				if inCancelMode {
+					reqTimeout = 800 * time.Millisecond
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
 				req, _ := http.NewRequestWithContext(ctx, "GET", optionURL, nil)
 				req.Header.Set("User-Agent", userAgent)
 				req.Header.Set("Referer", p.baseURL+"/reservations/calendar")
@@ -564,6 +607,13 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 							}
 						}
 						if allFull {
+							allSlotsFullMu.Lock()
+							if allSlotsFullSince.IsZero() {
+								allSlotsFullSince = time.Now()
+								log.Printf("[QUICKBURST] ★ All slots FULL — entering CANCELLATION MONITOR mode (faster polling)")
+							}
+							allSlotsFullMu.Unlock()
+
 							fullRotationsWithoutHit++
 							if fullRotationsWithoutHit == 1 {
 								log.Printf("[QUICKBURST] All %d slots capacity-full (after %d reqs). Will keep retrying for full burst duration.",

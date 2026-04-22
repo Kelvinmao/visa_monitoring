@@ -42,7 +42,7 @@ var defaultConfig = Config{
 	ReleaseHour:   20,
 	ReleaseMinute: 0,
 	StartEarlySec: 60,
-	BurstDuration: 10,
+	BurstDuration: 30,
 	WorkerCount:   3,
 }
 
