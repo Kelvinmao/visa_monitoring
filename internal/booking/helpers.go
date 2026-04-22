@@ -22,12 +22,12 @@ var (
 func buildTransport() *http.Transport {
 	return &http.Transport{
 		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
+			Timeout:   3 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 200,
-		MaxConnsPerHost:     200,
+		MaxIdleConns:        300,
+		MaxIdleConnsPerHost: 300,
+		MaxConnsPerHost:     300,
 		IdleConnTimeout:     90 * time.Second,
 		ForceAttemptHTTP2:   true,
 	}

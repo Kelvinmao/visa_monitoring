@@ -43,7 +43,7 @@ var defaultConfig = Config{
 	ReleaseMinute: 0,
 	StartEarlySec: 60,
 	BurstDuration: 30,
-	WorkerCount:   3,
+	WorkerCount:   300,
 }
 
 func Load(configPath string) (*Config, error) {

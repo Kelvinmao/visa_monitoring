@@ -10,5 +10,5 @@
   "release_minute": 0,
   "start_early_sec": 30,
   "burst_duration_min": 30,
-  "worker_count": 200
+  "worker_count": 300
 }

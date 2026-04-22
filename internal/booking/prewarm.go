@@ -48,6 +48,12 @@ type PreWarmedWorker struct {
 	guestFields   string
 	guestUnlocked string
 	guestBody     string // pre-encoded POST body (ready to send)
+
+	// Pre-fetched conf page tokens (filled during prewarm).
+	// If available, we skip GET conf and POST directly after guest 302.
+	confCsrf     string
+	confFields   string
+	confUnlocked string
 }
 
 // serverClockOffset is the estimated difference: server_time - local_time.
@@ -275,6 +281,52 @@ func (p *PreWarmClient) prefetchGuestTokens(worker *PreWarmedWorker) {
 
 	if worker.id == 0 {
 		log.Printf("[PREFETCH] worker=%d ✓ cached guest tokens (csrf=%s… fields=%d bytes)",
+			worker.id, csrf[:min(8, len(csrf))], len(fields))
+	}
+
+	// Also try to pre-fetch conf page tokens
+	p.prefetchConfTokens(worker)
+}
+
+// prefetchConfTokens tries to GET the conf page and cache the form tokens.
+// If successful, quickConfirm can skip GET conf and POST directly.
+func (p *PreWarmClient) prefetchConfTokens(worker *PreWarmedWorker) {
+	confURL := p.baseURL + "/reservations/conf"
+	req, _ := http.NewRequest("GET", confURL, nil)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Referer", p.baseURL+"/reservations/user/guest")
+
+	resp, err := worker.client.Do(req)
+	if err != nil {
+		if worker.id == 0 {
+			log.Printf("[PREFETCH-CONF] worker=%d error: %v", worker.id, err)
+		}
+		return
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		if worker.id == 0 {
+			log.Printf("[PREFETCH-CONF] worker=%d status=%d (not cached)", worker.id, resp.StatusCode)
+		}
+		return
+	}
+
+	csrf, fields, unlocked := extractFormTokens(string(body))
+	if csrf == "" || fields == "" {
+		if worker.id == 0 {
+			log.Printf("[PREFETCH-CONF] worker=%d no tokens on conf page", worker.id)
+		}
+		return
+	}
+
+	worker.confCsrf = csrf
+	worker.confFields = fields
+	worker.confUnlocked = unlocked
+
+	if worker.id == 0 {
+		log.Printf("[PREFETCH-CONF] worker=%d ✓ cached conf tokens (csrf=%s… fields=%d bytes)",
 			worker.id, csrf[:min(8, len(csrf))], len(fields))
 	}
 }
@@ -539,12 +591,13 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 						req.URL, _ = url.Parse(pbSlot.optionURL)
 					}
 				} else {
-					diagBody, _ := io.ReadAll(resp.Body)
+					diagBuf := make([]byte, 512)
+					n, _ := io.ReadFull(resp.Body, diagBuf)
 					resp.Body.Close()
-					bodyStr := string(diagBody)
+					bodyStr := string(diagBuf[:n])
 
 					if count <= 3 || count%50 == 0 {
-						log.Printf("[DIAG] worker=%d slot=%s status=%d bodyLen=%d", w.id, mySlot, resp.StatusCode, len(diagBody))
+						log.Printf("[DIAG] worker=%d slot=%s status=%d body=%q", w.id, mySlot, resp.StatusCode, shortBody([]byte(bodyStr)))
 					}
 
 					if strings.Contains(bodyStr, "上限に達した") {
@@ -853,10 +906,48 @@ func (p *PreWarmClient) quickSubmit(worker *PreWarmedWorker, guestURL, date, tim
 func (p *PreWarmClient) quickConfirm(worker *PreWarmedWorker, timeSlot string) *Result {
 	confURL := p.baseURL + "/reservations/conf"
 
+	// Try fast path: use pre-fetched conf tokens
+	if worker.confCsrf != "" && worker.confFields != "" {
+		formData := url.Values{}
+		formData.Set("_method", "POST")
+		formData.Set("_csrfToken", worker.confCsrf)
+		formData.Set("_Token[fields]", worker.confFields)
+		formData.Set("_Token[unlocked]", worker.confUnlocked)
+
+		req, _ := http.NewRequest("POST", confURL, strings.NewReader(formData.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Origin", p.baseURL)
+		req.Header.Set("Referer", confURL)
+
+		confPostStart := time.Now()
+		resp2, err := worker.client.Do(req)
+		if err != nil {
+			log.Printf("[QUICKCONFIRM] worker=%d conf POST error: %v", worker.id, err)
+			goto slowPath
+		}
+		io.Copy(io.Discard, resp2.Body)
+		resp2.Body.Close()
+		log.Printf("[QUICKCONFIRM] worker=%d conf POST (cached) status=%d latency=%v",
+			worker.id, resp2.StatusCode, time.Since(confPostStart).Round(time.Millisecond))
+
+		if resp2.StatusCode == 302 {
+			location := resp2.Header.Get("Location")
+			if strings.Contains(location, "/finish/") {
+				log.Printf("[QUICKCONFIRM] ★ worker=%d BOOKING SUCCESS! slot=%s location=%s", worker.id, timeSlot, location)
+				return &Result{Success: true, TimeSlot: timeSlot, Message: "Booked: " + location}
+			}
+		}
+
+		// Cached tokens rejected, fall back to slow path
+		worker.confCsrf = ""
+		log.Printf("[QUICKCONFIRM] worker=%d cached conf rejected, retrying with fresh GET", worker.id)
+	}
+
+slowPath:
 	log.Printf("[QUICKCONFIRM] worker=%d GET conf page for slot=%s", worker.id, timeSlot)
 	confStart := time.Now()
 
-	// GET conf page for tokens, then POST.
 	req, _ := http.NewRequest("GET", confURL, nil)
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", p.baseURL+"/reservations/user/guest")
