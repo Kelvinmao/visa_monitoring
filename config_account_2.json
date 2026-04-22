@@ -1,15 +1,14 @@
 {
-  "target_date": "2026/06/25",
+  "target_date": "2026/06/26",
   "event_id": "16",
   "plan_id": "20",
   "family_name": "Mao",
   "first_name": "Kaining",
   "phone": "825-984-7284",
   "email": "kaining+account_2@layer6.ai",
-  "release_hour": 2,
-  "release_minute": 50,
+  "release_hour": 9,
+  "release_minute": 0,
   "start_early_sec": 30,
-  "burst_duration_min": 2,
-  "worker_count": 100,
-  "base_url": "http://127.0.0.1:9876"
+  "burst_duration_min": 30,
+  "worker_count": 200
 }
