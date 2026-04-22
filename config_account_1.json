@@ -6,10 +6,10 @@
   "first_name": "Kaining",
   "phone": "825-984-7284",
   "email": "kaining+account_1@layer6.ai",
-  "release_hour": 12,
-  "release_minute": 9,
+  "release_hour": 1,
+  "release_minute": 7,
   "start_early_sec": 30,
-  "burst_duration_min": 30,
-  "worker_count": 100,
+  "burst_duration_min": 2,
+  "worker_count": 50,
   "base_url": "http://127.0.0.1:9876"
 }

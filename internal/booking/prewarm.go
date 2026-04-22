@@ -398,39 +398,19 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 	fullRotationsWithoutHit := int64(0)
 	const minPerSlotForExit = 20 // require >=20 capacity-full per slot before considering exit
 
-	// All-slots-full detection for fast cancellation mode
-	var allSlotsFullSince time.Time
-	var allSlotsFullMu sync.Mutex
-
-	// Background session keepalive during burst
-	keepAliveCtx, keepAliveCancel := context.WithCancel(context.Background())
-	defer keepAliveCancel()
-	go func() {
-		ticker := time.NewTicker(45 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-keepAliveCtx.Done():
-				return
-			case <-ticker.C:
-				// Quick keepalive: just hit calendar page
-				for _, w := range p.clients {
-					if w.csrfToken == "" {
-						continue
-					}
-					req, _ := http.NewRequest("GET", p.baseURL+"/reservations/calendar", nil)
-					req.Header.Set("User-Agent", userAgent)
-					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					resp, err := w.client.Do(req.WithContext(ctx))
-					cancel()
-					if err == nil && resp != nil {
-						io.Copy(io.Discard, resp.Body)
-						resp.Body.Close()
-					}
-				}
-			}
+	// Pre-construct all option URLs to avoid fmt.Sprintf during burst
+	type prebuiltSlot struct {
+		slotName  string
+		optionURL string
+	}
+	prebuiltSlots := make([]prebuiltSlot, len(slots))
+	for i, slot := range slots {
+		prebuiltSlots[i] = prebuiltSlot{
+			slotName: slot,
+			optionURL: fmt.Sprintf("%s/reservations/option?event_id=%s&event_plan_id=%s&date=%s&time_from=%s",
+				p.baseURL, p.cfg.EventID, p.cfg.PlanID, url.QueryEscape(date), url.QueryEscape(slot)),
 		}
-	}()
+	}
 
 	firstProfiles := make([]firstReqProfile, len(p.clients))
 
@@ -442,7 +422,6 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 		if worker.csrfToken == "" {
 			continue
 		}
-		// Assign each worker a starting slot index. Multiple workers share a slot.
 		startIdx := workerIdx % len(slots)
 		seqIdx := workerIdx
 		workerIdx++
@@ -453,14 +432,13 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 
 			firstProfiles[w.id].goroutineSpawn = time.Now()
 
-			// All workers fire at burstStart simultaneously.
-			// burstStart is set ~3s before estimated server release. Workers that get
-			// "受付期間外" (too early) immediately retry in a tight loop (~100-150ms
-			// per rejection), naturally carpet-bombing the exact opening moment.
-			// 50 workers × ~7 retries/sec = ~350 requests/sec at the transition.
-			myStart := burstStart
+			// Pre-construct request object to minimize work after burst
+			pbSlot := prebuiltSlots[currentIdx%len(slots)]
+			req, _ := http.NewRequest("GET", pbSlot.optionURL, nil)
+			req.Header.Set("User-Agent", userAgent)
+			req.Header.Set("Referer", p.baseURL+"/reservations/calendar")
 
-			// Sleep until close to myStart, then busy-wait for precision.
+			myStart := burstStart
 			waitDur := time.Until(myStart)
 			if waitDur > 500*time.Microsecond {
 				time.Sleep(waitDur - 500*time.Microsecond)
@@ -470,11 +448,8 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 			}
 
 			firstProfiles[w.id].busyWaitExit = time.Now()
-			if w.id == 0 {
-				log.Printf("[QUICKBURST] Worker 0 woke up at %s (target was %s, delta=%v)",
-					firstProfiles[w.id].busyWaitExit.Format("15:04:05.000000"),
-					burstStart.Format("15:04:05.000000"),
-					firstProfiles[w.id].busyWaitExit.Sub(burstStart))
+			if firstProfiles[w.id].doStart.IsZero() {
+				firstProfiles[w.id].doStart = time.Now()
 			}
 
 			for {
@@ -482,35 +457,17 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 					return
 				}
 
-				mySlot := slots[currentIdx%len(slots)]
-				optionURL := fmt.Sprintf("%s/reservations/option?event_id=%s&event_plan_id=%s&date=%s&time_from=%s",
-					p.baseURL, p.cfg.EventID, p.cfg.PlanID, url.QueryEscape(date), url.QueryEscape(mySlot))
-
-				// Use shorter timeout in cancellation mode for faster cycling
-				reqTimeout := 2 * time.Second
-				allSlotsFullMu.Lock()
-				inCancelMode := !allSlotsFullSince.IsZero() && time.Since(allSlotsFullSince) > 30*time.Second
-				allSlotsFullMu.Unlock()
-				if inCancelMode {
-					reqTimeout = 800 * time.Millisecond
-				}
-
-				ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
-				req, _ := http.NewRequestWithContext(ctx, "GET", optionURL, nil)
-				req.Header.Set("User-Agent", userAgent)
-				req.Header.Set("Referer", p.baseURL+"/reservations/calendar")
-
-				if firstProfiles[w.id].doStart.IsZero() {
-					firstProfiles[w.id].doStart = time.Now()
-				}
+				pbSlot = prebuiltSlots[currentIdx%len(slots)]
+				req.URL, _ = url.Parse(pbSlot.optionURL)
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				req = req.WithContext(ctx)
 
 				resp, err := w.client.Do(req)
+				cancel()
 
 				if firstProfiles[w.id].doStart.IsZero() == false && firstProfiles[w.id].doEnd.IsZero() {
 					firstProfiles[w.id].doEnd = time.Now()
 				}
-
-				cancel()
 
 				count := atomic.AddInt64(&requestCount, 1)
 				now := time.Now().UnixNano()
@@ -522,17 +479,16 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 					sOther := atomic.LoadInt64(&statusOther)
 					sErr := atomic.LoadInt64(&statusErr)
 					elapsed := time.Since(burstStart).Round(time.Millisecond)
-					log.Printf("[QUICKBURST] t+%v Requests: %d | 200:%d 302:%d 400:%d err:%d other:%d (slot=%s)",
-						elapsed, count, s200, s302, s400, sErr, sOther, mySlot)
+					log.Printf("[QUICKBURST] t+%v Requests: %d | 200:%d 302:%d 400:%d err:%d other:%d",
+						elapsed, count, s200, s302, s400, sErr, sOther)
 				}
 
 				if err != nil {
 					atomic.AddInt64(&statusErr, 1)
-					if count <= 5 {
-						log.Printf("[QUICKBURST] worker=%d req error: %v", w.id, err)
-					}
 					continue
 				}
+
+				mySlot := pbSlot.slotName
 
 				switch {
 				case resp.StatusCode == 200:
@@ -546,11 +502,10 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				}
 
 				if resp.StatusCode == 200 {
-					// Option page loaded — submit option form then proceed to guest
 					optBody, _ := io.ReadAll(resp.Body)
 					resp.Body.Close()
 					guestURL := p.submitOptionPage(w, optBody)
-					log.Printf("[QUICKBURST] worker=%d GOT 200 for slot=%s → submitting via %s", w.id, mySlot, guestURL)
+					log.Printf("[QUICKBURST] worker=%d GOT 200 for slot=%s → submitting", w.id, mySlot)
 					result := p.quickSubmit(w, guestURL, date, mySlot)
 					if result.Success {
 						select {
@@ -560,9 +515,10 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 						atomic.StoreInt32(&stopFlag, 1)
 						return
 					}
-					// Submission failed — rotate to next slot
 					currentIdx++
-					log.Printf("[QUICKBURST] worker=%d submit failed for %s, rotating to %s", w.id, mySlot, slots[currentIdx%len(slots)])
+					// Update prebuilt slot for next iteration
+					pbSlot = prebuiltSlots[currentIdx%len(slots)]
+					req.URL, _ = url.Parse(pbSlot.optionURL)
 				} else if resp.StatusCode == 302 {
 					location := resp.Header.Get("Location")
 					drainBody(resp)
@@ -578,25 +534,20 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 							atomic.StoreInt32(&stopFlag, 1)
 							return
 						}
-						// Submission failed — rotate to next slot
 						currentIdx++
-						log.Printf("[QUICKBURST] worker=%d submit failed for %s, rotating to %s", w.id, mySlot, slots[currentIdx%len(slots)])
+						pbSlot = prebuiltSlots[currentIdx%len(slots)]
+						req.URL, _ = url.Parse(pbSlot.optionURL)
 					}
-					// Non-guest redirect — slot not available yet, poll again immediately
 				} else {
-					// 4xx/5xx — read body for diagnosis
 					diagBody, _ := io.ReadAll(resp.Body)
 					resp.Body.Close()
 					bodyStr := string(diagBody)
 
 					if count <= 3 || count%50 == 0 {
-						log.Printf("[DIAG] worker=%d slot=%s status=%d bodyLen=%d body=%q",
-							w.id, mySlot, resp.StatusCode, len(diagBody), shortBody(diagBody))
+						log.Printf("[DIAG] worker=%d slot=%s status=%d bodyLen=%d", w.id, mySlot, resp.StatusCode, len(diagBody))
 					}
 
 					if strings.Contains(bodyStr, "上限に達した") {
-						// Capacity full — rotate to next slot but keep trying.
-						// Slots can reopen if someone cancels, so never give up early.
 						slotMu.Lock()
 						slotStates[currentIdx%len(slots)].capacityFull++
 						allFull := true
@@ -607,37 +558,30 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 							}
 						}
 						if allFull {
-							allSlotsFullMu.Lock()
-							if allSlotsFullSince.IsZero() {
-								allSlotsFullSince = time.Now()
-								log.Printf("[QUICKBURST] ★ All slots FULL — entering CANCELLATION MONITOR mode (faster polling)")
-							}
-							allSlotsFullMu.Unlock()
-
 							fullRotationsWithoutHit++
 							if fullRotationsWithoutHit == 1 {
 								log.Printf("[QUICKBURST] All %d slots capacity-full (after %d reqs). Will keep retrying for full burst duration.",
 									len(slots), count)
 							}
-							// Log periodically but do NOT stop — keep polling
 							if fullRotationsWithoutHit%50 == 0 {
 								log.Printf("[QUICKBURST] Still all slots full, rotation %d (%d reqs)",
 									fullRotationsWithoutHit, count)
 							}
 						}
 						slotMu.Unlock()
-
 						currentIdx++
+						pbSlot = prebuiltSlots[currentIdx%len(slots)]
+						req.URL, _ = url.Parse(pbSlot.optionURL)
 						continue
 					}
 
 					if strings.Contains(bodyStr, "予約できません") || strings.Contains(bodyStr, "受付期間外") {
-						// Not open yet — keep polling same slot
 						continue
 					}
 
-					// Other 4xx/5xx — rotate slot and retry immediately
 					currentIdx++
+					pbSlot = prebuiltSlots[currentIdx%len(slots)]
+					req.URL, _ = url.Parse(pbSlot.optionURL)
 				}
 			}
 		}(worker, startIdx, seqIdx)
