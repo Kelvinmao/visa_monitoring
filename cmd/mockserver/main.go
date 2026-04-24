@@ -132,11 +132,17 @@ func main() {
 	log.Printf("ServerLatency:     %dms", scenario.ServerLatencyMs)
 	log.Printf("ReleaseTime:       %s (in ~%ds)", releaseAt.Format("15:04:05.000"), *releaseDelay)
 	log.Printf("========================================")
+	log.Printf("")
+	log.Printf("FAIR RACE MODE: ALL requests (yours + competitors) go through")
+	log.Printf("the same server latency (%dms). Competitors start at T+0 with", scenario.ServerLatencyMs)
+	log.Printf("random processing delays (5-500ms). Our workers also start at T+0")
+	log.Printf("with the same server latency. Fair competition!")
+	log.Printf("")
 
-	// Schedule competitors as actual HTTP clients with realistic delays.
-	// Each competitor makes a GET request to /reservations/option just like our bot.
-	// Their network delay determines when their request arrives at the server.
-	// The server processes requests in arrival order - first come first served.
+	// Schedule competitors as actual HTTP clients that hit the server at T+0.
+	// Each competitor has a "processing delay" that simulates their local CPU
+	// time to build and send the request. This is the same delay any bot would have.
+	// The server processes requests in the order they arrive.
 	go func() {
 		totalCompetitors := scenario.CompetitorGrab
 		if totalCompetitors <= 0 {
@@ -155,24 +161,24 @@ func main() {
 		}
 
 		competitorID := 0
-		tierCounts := map[string]int{"fast": 0, "tokyo": 0, "regional": 0, "slow": 0}
+		tierCounts := map[string]int{"fast": 0, "normal": 0, "slow": 0}
 
+		// ALL competitors start at T+0 (same time as our workers)
+		// Their "delay" is how long it takes them to build and send the request
+		// This simulates different bot efficiency, not network distance
 		for slotName := range slots {
 			for i := 0; i < perSlot; i++ {
-				var networkDelay time.Duration
+				var processingDelay time.Duration
 				r := rand.Intn(100)
 				switch {
-				case r < 2: // Tier 1: super fast bots (2%) - 5-15ms
-					networkDelay = time.Duration(5+rand.Intn(10)) * time.Millisecond
+				case r < 10: // Fast bots (10%) - well optimized, 5-30ms
+					processingDelay = time.Duration(5+rand.Intn(25)) * time.Millisecond
 					tierCounts["fast"]++
-				case r < 15: // Tier 2: tokyo bots (13%) - 20-80ms
-					networkDelay = time.Duration(20+rand.Intn(60)) * time.Millisecond
-					tierCounts["tokyo"]++
-				case r < 60: // Tier 3: regional (45%) - 100-400ms
-					networkDelay = time.Duration(100+rand.Intn(300)) * time.Millisecond
-					tierCounts["regional"]++
-				default: // Tier 4: slow (40%) - 400-1000ms
-					networkDelay = time.Duration(400+rand.Intn(600)) * time.Millisecond
+				case r < 60: // Normal bots (50%) - average, 30-150ms
+					processingDelay = time.Duration(30+rand.Intn(120)) * time.Millisecond
+					tierCounts["normal"]++
+				default: // Slow bots (40%) - poorly optimized, 150-500ms
+					processingDelay = time.Duration(150+rand.Intn(350)) * time.Millisecond
 					tierCounts["slow"]++
 				}
 
@@ -182,7 +188,6 @@ func main() {
 				go func(slot string, delay time.Duration, id int) {
 					time.Sleep(delay)
 
-					// Competitor hits the option endpoint just like our bot
 					optionURL := fmt.Sprintf("http://127.0.0.1:%d/reservations/option?event_id=16&event_plan_id=20&date=2026%%2F06%%2F25&time_from=%s",
 						*port, slot)
 					client := &http.Client{
@@ -201,31 +206,20 @@ func main() {
 						return
 					}
 					defer resp.Body.Close()
-
-					// If they got a 200 or 302, they successfully claimed a slot
-					if resp.StatusCode == 200 || resp.StatusCode == 302 {
-						// Mark the slot as taken in our tracking
-						slotsMu.Lock()
-						if s, ok := slots[slot]; ok && s.taken < s.capacity {
-							// Slot was available when this request arrived
-						}
-						slotsMu.Unlock()
-					}
-				}(slotName, networkDelay, cid)
+				}(slotName, processingDelay, cid)
 			}
 		}
 
-		log.Printf("[COMPETITORS] %d total competitors scheduled", totalCompetitors)
-		log.Printf("[COMPETITORS] Tier 1 (fast <20ms): %d", tierCounts["fast"])
-		log.Printf("[COMPETITORS] Tier 2 (tokyo <100ms): %d", tierCounts["tokyo"])
-		log.Printf("[COMPETITORS] Tier 3 (regional <400ms): %d", tierCounts["regional"])
-		log.Printf("[COMPETITORS] Tier 4 (slow >=400ms): %d", tierCounts["slow"])
+		log.Printf("[COMPETITORS] %d total competitors start at T+0", totalCompetitors)
+		log.Printf("[COMPETITORS] Fast bots (5-30ms): %d", tierCounts["fast"])
+		log.Printf("[COMPETITORS] Normal bots (30-150ms): %d", tierCounts["normal"])
+		log.Printf("[COMPETITORS] Slow bots (150-500ms): %d", tierCounts["slow"])
 
 		// Wait for all competitors to finish
 		time.Sleep(1200 * time.Millisecond)
 		slotsMu.Lock()
 		for slotName, slot := range slots {
-			log.Printf("[COMPETITORS] Slot %s: %d/%d taken by competitors", slotName, slot.taken, slot.capacity)
+			log.Printf("[COMPETITORS] Slot %s: %d/%d taken", slotName, slot.taken, slot.capacity)
 		}
 		slotsMu.Unlock()
 	}()
@@ -272,6 +266,8 @@ func main() {
 }
 
 func addLatency() {
+	// Server processing latency: simulates real server response time
+	// This applies to ALL requests equally (yours + competitors)
 	if scenario.ServerLatencyMs > 0 {
 		time.Sleep(time.Duration(scenario.ServerLatencyMs) * time.Millisecond)
 	}
