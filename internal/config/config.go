@@ -2,8 +2,11 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -51,13 +54,11 @@ func Load(configPath string) (*Config, error) {
 
 	if configPath != "" {
 		data, err := os.ReadFile(configPath)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil {
 			return nil, err
 		}
-		if err == nil {
-			if err := json.Unmarshal(data, &cfg); err != nil {
-				return nil, err
-			}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return nil, err
 		}
 	}
 
@@ -106,6 +107,9 @@ func Load(configPath string) (*Config, error) {
 		}
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }
 
@@ -145,4 +149,55 @@ func (c *Config) GetStartTime() time.Time {
 
 func (c *Config) GetEndTime() time.Time {
 	return c.GetNextReleaseTime().Add(time.Duration(c.BurstDuration) * time.Minute)
+}
+
+func (c *Config) Validate() error {
+	var missing []string
+	required := map[string]string{
+		"target_date": c.TargetDate,
+		"event_id":    c.EventID,
+		"plan_id":     c.PlanID,
+		"family_name": c.FamilyName,
+		"first_name":  c.FirstName,
+		"phone":       c.Phone,
+		"email":       c.Email,
+	}
+	for field, value := range required {
+		if strings.TrimSpace(value) == "" {
+			missing = append(missing, field)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required config fields: %s", strings.Join(missing, ", "))
+	}
+
+	if _, err := time.Parse("2006/01/02", c.TargetDate); err != nil {
+		return fmt.Errorf("target_date must use YYYY/MM/DD format: %w", err)
+	}
+	if c.ReleaseHour < 0 || c.ReleaseHour > 23 {
+		return fmt.Errorf("release_hour must be between 0 and 23, got %d", c.ReleaseHour)
+	}
+	if c.ReleaseMinute < 0 || c.ReleaseMinute > 59 {
+		return fmt.Errorf("release_minute must be between 0 and 59, got %d", c.ReleaseMinute)
+	}
+	if c.StartEarlySec < 0 {
+		return fmt.Errorf("start_early_sec must be >= 0, got %d", c.StartEarlySec)
+	}
+	if c.BurstDuration <= 0 {
+		return fmt.Errorf("burst_duration_min must be > 0, got %d", c.BurstDuration)
+	}
+	if c.WorkerCount <= 0 {
+		return fmt.Errorf("worker_count must be > 0, got %d", c.WorkerCount)
+	}
+	if c.BaseURL == "" {
+		return fmt.Errorf("base_url must not be empty")
+	}
+	parsed, err := url.Parse(c.BaseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("base_url must be an absolute URL, got %q", c.BaseURL)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("base_url must use http or https, got %q", parsed.Scheme)
+	}
+	return nil
 }

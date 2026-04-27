@@ -15,6 +15,7 @@ import (
 func main() {
 	configPath := flag.String("config", "config.json", "Config file path")
 	workers := flag.Int("workers", 0, "Number of concurrent workers (0 = use config value)")
+	probe := flag.Bool("probe", false, "Probe slots before burst for debugging; disabled by default because it can delay booking")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -66,7 +67,11 @@ func main() {
 
 	// Keep sessions alive in background
 	keepAliveStop := make(chan struct{})
-	go client.KeepAlive(keepAliveStop)
+	keepAliveDone := make(chan struct{})
+	go func() {
+		defer close(keepAliveDone)
+		client.KeepAlive(keepAliveStop)
+	}()
 
 	log.Printf("[MAIN] Calibrating server clock....")
 	booking.CalibrateServerClock(cfg.BaseURL, 30)
@@ -95,14 +100,23 @@ func main() {
 		time.Sleep(1 * time.Second)
 	}
 
-	// Stop keepalive now and wait for it to fully drain.
+	// Stop keepalive before burst. Wait briefly so keepalive does not compete
+	// with booking requests, but never let diagnostics delay the actual burst.
 	close(keepAliveStop)
-	log.Printf("[MAIN] KeepAlive stopped at %s (%.3fs before burst)",
-		time.Now().Format("15:04:05.000"), time.Until(burstStart).Seconds())
+	select {
+	case <-keepAliveDone:
+		log.Printf("[MAIN] KeepAlive stopped at %s (%.3fs before burst)",
+			time.Now().Format("15:04:05.000"), time.Until(burstStart).Seconds())
+	case <-time.After(500 * time.Millisecond):
+		log.Printf("[MAIN] KeepAlive stop timed out; proceeding with burst scheduling")
+	}
 
-	// Probe slots before burst to verify session validity
-	log.Printf("[MAIN] Probing slots to verify session...")
-	client.ProbeSlots(cfg.TargetDate)
+	if *probe {
+		log.Printf("[MAIN] Probing slots to verify session (debug mode; may delay burst)")
+		client.ProbeSlots(cfg.TargetDate)
+	} else {
+		log.Printf("[MAIN] Slot probe disabled; use -probe only for debugging")
+	}
 
 	// Now spawn QuickBurst — goroutines will sleep (not busy-wait) until burstStart
 	log.Printf("[MAIN] Spawning QuickBurst at %s (%.1fs before burst)",

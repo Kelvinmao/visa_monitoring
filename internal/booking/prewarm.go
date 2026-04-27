@@ -178,6 +178,11 @@ func (p *PreWarmClient) prewarmOneWorker(worker *PreWarmedWorker, date string) b
 	// Collect server clock sample from Date header (every worker contributes)
 	recordOffsetSample(resp.Header.Get("Date"))
 
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[Worker %d] Calendar GET failed: status=%d bodyLen=%d", worker.id, resp.StatusCode, len(body))
+		return false
+	}
+
 	matches := reCsrfValue.FindStringSubmatch(string(body))
 	if len(matches) < 2 {
 		log.Printf("[Worker %d] No CSRF token (status=%d bodyLen=%d)", worker.id, resp.StatusCode, len(body))
@@ -210,6 +215,12 @@ func (p *PreWarmClient) prewarmOneWorker(worker *PreWarmedWorker, date string) b
 	if worker.id == 0 {
 		log.Printf("[Worker 0] PreWarm session response: status=%d bodyLen=%d body=%q",
 			resp2.StatusCode, len(ajaxBody), shortBody(ajaxBody))
+	}
+
+	if resp2.StatusCode < 200 || resp2.StatusCode >= 300 {
+		log.Printf("[Worker %d] Calendar POST failed: status=%d bodyLen=%d body=%q",
+			worker.id, resp2.StatusCode, len(ajaxBody), shortBody(ajaxBody))
+		return false
 	}
 
 	// Step 3 (optional): pre-fetch guest page tokens.
@@ -515,7 +526,6 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				req = req.WithContext(ctx)
 
 				resp, err := w.client.Do(req)
-				cancel()
 
 				if firstProfiles[w.id].doStart.IsZero() == false && firstProfiles[w.id].doEnd.IsZero() {
 					firstProfiles[w.id].doEnd = time.Now()
@@ -537,6 +547,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 
 				if err != nil {
 					atomic.AddInt64(&statusErr, 1)
+					cancel()
 					continue
 				}
 
@@ -556,6 +567,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				if resp.StatusCode == 200 {
 					optBody, _ := io.ReadAll(resp.Body)
 					resp.Body.Close()
+					cancel()
 					guestURL := p.submitOptionPage(w, optBody)
 					log.Printf("[QUICKBURST] worker=%d GOT 200 for slot=%s → submitting", w.id, mySlot)
 					result := p.quickSubmit(w, guestURL, date, mySlot)
@@ -574,6 +586,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				} else if resp.StatusCode == 302 {
 					location := resp.Header.Get("Location")
 					drainBody(resp)
+					cancel()
 
 					if strings.Contains(location, "guest") {
 						log.Printf("[QUICKBURST] worker=%d GOT 302→guest for slot=%s → submitting", w.id, mySlot)
@@ -594,6 +607,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 					diagBuf := make([]byte, 512)
 					n, _ := io.ReadFull(resp.Body, diagBuf)
 					resp.Body.Close()
+					cancel()
 					bodyStr := string(diagBuf[:n])
 
 					if count <= 3 || count%50 == 0 {
