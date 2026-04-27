@@ -10,6 +10,5 @@
   "release_minute": 15,
   "start_early_sec": 30,
   "burst_duration_min": 2,
-  "worker_count": 200,
-  "base_url": "http://127.0.0.1:9876"
+  "worker_count": 200
 }
