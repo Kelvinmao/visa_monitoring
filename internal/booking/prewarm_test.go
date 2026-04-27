@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -298,10 +299,16 @@ func TestQuickBurstMultiWorkerOnlyOneResult(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestQuickBurstNonGuestRedirectContinues(t *testing.T) {
 	var attempts int32
+	var slotsMu sync.Mutex
+	seenSlots := make(map[string]bool)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/reservations/option":
+			slotsMu.Lock()
+			seenSlots[r.URL.Query().Get("time_from")] = true
+			slotsMu.Unlock()
+
 			n := atomic.AddInt32(&attempts, 1)
 			if n <= 4 {
 				w.Header().Set("Location", "/reservations/calendar")
@@ -338,6 +345,12 @@ func TestQuickBurstNonGuestRedirectContinues(t *testing.T) {
 	}
 	if atomic.LoadInt32(&attempts) < 5 {
 		t.Fatalf("expected >=5 option attempts, got %d", attempts)
+	}
+	slotsMu.Lock()
+	distinctSlots := len(seenSlots)
+	slotsMu.Unlock()
+	if distinctSlots < 2 {
+		t.Fatalf("expected non-guest redirects to rotate slots, saw %d distinct slot(s)", distinctSlots)
 	}
 }
 

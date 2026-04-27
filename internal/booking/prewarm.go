@@ -602,6 +602,10 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 						currentIdx++
 						pbSlot = prebuiltSlots[currentIdx%len(slots)]
 						req.URL, _ = url.Parse(pbSlot.optionURL)
+					} else {
+						currentIdx++
+						pbSlot = prebuiltSlots[currentIdx%len(slots)]
+						req.URL, _ = url.Parse(pbSlot.optionURL)
 					}
 				} else {
 					diagBuf := make([]byte, 512)
@@ -678,6 +682,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 	select {
 	case result, ok := <-results:
 		atomic.StoreInt32(&stopFlag, 1)
+		wg.Wait()
 		finalReqs := atomic.LoadInt64(&requestCount)
 		log.Printf("[QUICKBURST] Finished: totalRequests=%d, elapsed=%v", finalReqs, time.Since(burstStart).Round(time.Millisecond))
 		p.printProfile(firstProfiles, burstStart)
@@ -687,6 +692,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 		return &Result{Success: false, Message: fmt.Sprintf("All workers exited after %d requests", finalReqs)}
 	case <-time.After(totalTimeout):
 		atomic.StoreInt32(&stopFlag, 1)
+		wg.Wait()
 		finalReqs := atomic.LoadInt64(&requestCount)
 		s200 := atomic.LoadInt64(&status200)
 		s302 := atomic.LoadInt64(&status302)
