@@ -495,11 +495,12 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 
 			firstProfiles[w.id].goroutineSpawn = time.Now()
 
-			// Pre-construct request object to minimize work after burst
-			pbSlot := prebuiltSlots[currentIdx%len(slots)]
-			req, _ := http.NewRequest("GET", pbSlot.optionURL, nil)
-			req.Header.Set("User-Agent", userAgent)
-			req.Header.Set("Referer", p.baseURL+"/reservations/calendar")
+			// Validate the first option URL before burst; each loop builds a
+			// fresh request so Cookie headers cannot accumulate across retries.
+			if _, err := url.Parse(prebuiltSlots[currentIdx%len(slots)].optionURL); err != nil {
+				log.Printf("[QUICKBURST] worker=%d invalid option URL: %v", w.id, err)
+				return
+			}
 
 			myStart := burstStart
 			waitDur := time.Until(myStart)
@@ -520,10 +521,16 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 					return
 				}
 
-				pbSlot = prebuiltSlots[currentIdx%len(slots)]
-				req.URL, _ = url.Parse(pbSlot.optionURL)
+				pbSlot := prebuiltSlots[currentIdx%len(slots)]
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				req = req.WithContext(ctx)
+				req, reqErr := http.NewRequestWithContext(ctx, "GET", pbSlot.optionURL, nil)
+				if reqErr != nil {
+					atomic.AddInt64(&statusErr, 1)
+					cancel()
+					continue
+				}
+				req.Header.Set("User-Agent", userAgent)
+				req.Header.Set("Referer", p.baseURL+"/reservations/calendar")
 
 				resp, err := w.client.Do(req)
 
@@ -580,9 +587,6 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 						return
 					}
 					currentIdx++
-					// Update prebuilt slot for next iteration
-					pbSlot = prebuiltSlots[currentIdx%len(slots)]
-					req.URL, _ = url.Parse(pbSlot.optionURL)
 				} else if resp.StatusCode == 302 {
 					location := resp.Header.Get("Location")
 					drainBody(resp)
@@ -599,14 +603,8 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 							atomic.StoreInt32(&stopFlag, 1)
 							return
 						}
-						currentIdx++
-						pbSlot = prebuiltSlots[currentIdx%len(slots)]
-						req.URL, _ = url.Parse(pbSlot.optionURL)
-					} else {
-						currentIdx++
-						pbSlot = prebuiltSlots[currentIdx%len(slots)]
-						req.URL, _ = url.Parse(pbSlot.optionURL)
 					}
+					currentIdx++
 				} else {
 					diagBuf := make([]byte, 512)
 					n, _ := io.ReadFull(resp.Body, diagBuf)
@@ -641,8 +639,6 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 						}
 						slotMu.Unlock()
 						currentIdx++
-						pbSlot = prebuiltSlots[currentIdx%len(slots)]
-						req.URL, _ = url.Parse(pbSlot.optionURL)
 						continue
 					}
 
@@ -651,8 +647,6 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 					}
 
 					currentIdx++
-					pbSlot = prebuiltSlots[currentIdx%len(slots)]
-					req.URL, _ = url.Parse(pbSlot.optionURL)
 				}
 			}
 		}(worker, startIdx, seqIdx)
