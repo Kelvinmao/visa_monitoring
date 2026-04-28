@@ -23,7 +23,7 @@ type AggressiveClient struct {
 type aggressiveWorker struct {
 	id     int
 	client *http.Client
-	ready  bool
+	ready  atomic.Bool
 }
 
 func NewAggressiveClient(cfg *config.Config, numWorkers int) *AggressiveClient {
@@ -76,7 +76,12 @@ func (a *AggressiveClient) WarmUp() error {
 			wg.Add(1)
 			go func(w *aggressiveWorker) {
 				defer wg.Done()
-				req, _ := http.NewRequest("GET", a.baseURL+"/reservations/calendar", nil)
+				req, err := http.NewRequest("GET", a.baseURL+"/reservations/calendar", nil)
+				if err != nil {
+					log.Printf("[WARMUP] worker=%d create request failed: %v", w.id, err)
+					atomic.AddInt32(&errCount, 1)
+					return
+				}
 				req.Header.Set("User-Agent", userAgent)
 				resp, err := w.client.Do(req)
 				if err != nil {
@@ -114,7 +119,7 @@ func (a *AggressiveClient) InitAllSessions(date string) error {
 		if attempt > 0 {
 			var pending []*aggressiveWorker
 			for _, w := range a.workers {
-				if !w.ready {
+				if !w.ready.Load() {
 					pending = append(pending, w)
 				}
 			}
@@ -128,7 +133,7 @@ func (a *AggressiveClient) InitAllSessions(date string) error {
 
 		var pending []*aggressiveWorker
 		for _, w := range a.workers {
-			if !w.ready {
+			if !w.ready.Load() {
 				pending = append(pending, w)
 			}
 		}
@@ -149,7 +154,7 @@ func (a *AggressiveClient) InitAllSessions(date string) error {
 						log.Printf("[Worker %d] Session init failed: %v", w.id, err)
 						return
 					}
-					w.ready = true
+					w.ready.Store(true)
 					atomic.AddInt32(&readyCount, 1)
 				}(w)
 			}
@@ -173,15 +178,21 @@ func (a *AggressiveClient) InitAllSessions(date string) error {
 
 func (a *AggressiveClient) initWorkerSession(w *aggressiveWorker, date string) error {
 	// Step 1: get CSRF token
-	req, _ := http.NewRequest("GET", a.baseURL+"/reservations/calendar", nil)
+	req, err := http.NewRequest("GET", a.baseURL+"/reservations/calendar", nil)
+	if err != nil {
+		return fmt.Errorf("create calendar request: %w", err)
+	}
 	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return err
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("read calendar response: %w", err)
+	}
 
 	csrfMatch := reCsrfValue.FindStringSubmatch(string(body))
 	if len(csrfMatch) < 2 {
@@ -197,7 +208,10 @@ func (a *AggressiveClient) initWorkerSession(w *aggressiveWorker, date string) e
 	formData.Set("search", "exec")
 	formData.Set("_csrfToken", csrfMatch[1])
 
-	req2, _ := http.NewRequest("POST", a.baseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	req2, err := http.NewRequest("POST", a.baseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	if err != nil {
+		return fmt.Errorf("create calendar POST request: %w", err)
+	}
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req2.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req2.Header.Set("User-Agent", userAgent)
@@ -222,7 +236,7 @@ func (a *AggressiveClient) BurstBook(date string, _ int) *Result {
 
 	readyWorkers := 0
 	for _, w := range a.workers {
-		if !w.ready {
+		if !w.ready.Load() {
 			continue
 		}
 		readyWorkers++
@@ -230,7 +244,7 @@ func (a *AggressiveClient) BurstBook(date string, _ int) *Result {
 	log.Printf("[BURST] Starting with %d ready workers, %d slots", readyWorkers, len(slots))
 
 	for i, w := range a.workers {
-		if !w.ready {
+		if !w.ready.Load() {
 			continue
 		}
 		slot := slots[i%len(slots)]
@@ -268,7 +282,11 @@ func (a *AggressiveClient) workerLoop(w *aggressiveWorker, date, timeSlot string
 			return
 		}
 
-		req, _ := http.NewRequest("GET", optionURL, nil)
+		req, err := http.NewRequest("GET", optionURL, nil)
+		if err != nil {
+			log.Printf("[Worker %d] Create option request failed: %v", w.id, err)
+			return
+		}
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Referer", a.baseURL+"/reservations/calendar")
 
@@ -318,17 +336,26 @@ func (a *AggressiveClient) submitBooking(client *http.Client, guestURL, timeSlot
 		guestURL = a.baseURL + guestURL
 	}
 
-	req, _ := http.NewRequest("GET", guestURL, nil)
+	req, err := http.NewRequest("GET", guestURL, nil)
+	if err != nil {
+		return &Result{Success: false, Message: fmt.Sprintf("Create guest request failed: %v", err)}
+	}
 	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return &Result{Success: false, Message: "Guest page failed"}
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		return &Result{Success: false, Message: fmt.Sprintf("Read guest response failed: %v", err)}
+	}
 
 	tokenCsrf, tokenFields, tokenUnlocked := extractFormTokens(string(body))
+	if tokenCsrf == "" || tokenFields == "" {
+		return &Result{Success: false, Message: "No form tokens on guest page"}
+	}
 
 	// FIX: use SplitPhone from config instead of hard-coded digits
 	parts := SplitPhone(a.cfg.Phone)
@@ -348,7 +375,10 @@ func (a *AggressiveClient) submitBooking(client *http.Client, guestURL, timeSlot
 	formData.Set("_Token[fields]", tokenFields)
 	formData.Set("_Token[unlocked]", tokenUnlocked)
 
-	req2, _ := http.NewRequest("POST", guestURL, strings.NewReader(formData.Encode()))
+	req2, err := http.NewRequest("POST", guestURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return &Result{Success: false, Message: fmt.Sprintf("Create submit request failed: %v", err)}
+	}
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req2.Header.Set("User-Agent", userAgent)
 	req2.Header.Set("Origin", a.baseURL)
@@ -367,27 +397,41 @@ func (a *AggressiveClient) submitBooking(client *http.Client, guestURL, timeSlot
 }
 
 func (a *AggressiveClient) confirmBooking(client *http.Client, timeSlot string) *Result {
-	req, _ := http.NewRequest("GET", a.baseURL+"/reservations/conf", nil)
+	req, err := http.NewRequest("GET", a.baseURL+"/reservations/conf", nil)
+	if err != nil {
+		return &Result{Success: false, Message: fmt.Sprintf("Create conf request failed: %v", err)}
+	}
 	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return &Result{Success: false, Message: "Conf page failed"}
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		return &Result{Success: false, Message: fmt.Sprintf("Read conf response failed: %v", err)}
+	}
 
-	tokenCsrf, tokenFields, _ := extractFormTokens(string(body))
+	tokenCsrf, tokenFields, tokenUnlocked := extractFormTokens(string(body))
+	if tokenCsrf == "" || tokenFields == "" {
+		return &Result{Success: false, Message: "No form tokens on conf page"}
+	}
 
 	formData := url.Values{}
 	formData.Set("_method", "POST")
 	formData.Set("_csrfToken", tokenCsrf)
 	formData.Set("_Token[fields]", tokenFields)
+	formData.Set("_Token[unlocked]", tokenUnlocked)
 
-	req2, _ := http.NewRequest("POST", a.baseURL+"/reservations/conf", strings.NewReader(formData.Encode()))
+	req2, err := http.NewRequest("POST", a.baseURL+"/reservations/conf", strings.NewReader(formData.Encode()))
+	if err != nil {
+		return &Result{Success: false, Message: fmt.Sprintf("Create confirm request failed: %v", err)}
+	}
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req2.Header.Set("User-Agent", userAgent)
 	req2.Header.Set("Origin", a.baseURL)
+	req2.Header.Set("Referer", a.baseURL+"/reservations/conf")
 
 	resp2, err := client.Do(req2)
 	if err != nil {

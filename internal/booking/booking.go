@@ -68,14 +68,20 @@ func (c *Client) InitSession(date string) error {
 
 	log.Printf("[INIT] Establishing session for %s", date)
 
-	req, _ := http.NewRequest("GET", c.cfg.BaseURL+"/reservations/calendar", nil)
+	req, err := http.NewRequest("GET", c.cfg.BaseURL+"/reservations/calendar", nil)
+	if err != nil {
+		return fmt.Errorf("create calendar request: %w", err)
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return err
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("read calendar response: %w", err)
+	}
 
 	reCsrf := regexp.MustCompile(`name="_csrfToken"[^>]*value="([^"]+)"`)
 	csrfMatch := reCsrf.FindStringSubmatch(string(body))
@@ -91,7 +97,10 @@ func (c *Client) InitSession(date string) error {
 	formData.Set("search", "exec")
 	formData.Set("_csrfToken", csrfMatch[1])
 
-	req2, _ := http.NewRequest("POST", c.cfg.BaseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	req2, err := http.NewRequest("POST", c.cfg.BaseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	if err != nil {
+		return fmt.Errorf("create calendar POST request: %w", err)
+	}
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req2.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -108,7 +117,10 @@ func (c *Client) InitSession(date string) error {
 }
 
 func (c *Client) extractCSRFToken() (string, error) {
-	req, _ := http.NewRequest("GET", c.cfg.BaseURL+"/reservations/calendar", nil)
+	req, err := http.NewRequest("GET", c.cfg.BaseURL+"/reservations/calendar", nil)
+	if err != nil {
+		return "", fmt.Errorf("create calendar request: %w", err)
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 	resp, err := c.client.Do(req)
@@ -117,7 +129,10 @@ func (c *Client) extractCSRFToken() (string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read calendar response: %w", err)
+	}
 
 	re := regexp.MustCompile(`<input[^>]+name="_csrfToken"[^>]+value="([^"]+)"`)
 	matches := re.FindStringSubmatch(string(body))
@@ -143,7 +158,10 @@ func (c *Client) CheckAvailableSlots(date string) ([]map[string]string, error) {
 	formData.Set("search", "exec")
 	formData.Set("_csrfToken", csrfToken)
 
-	req, _ := http.NewRequest("POST", c.cfg.BaseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	req, err := http.NewRequest("POST", c.cfg.BaseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("create calendar POST request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -154,7 +172,10 @@ func (c *Client) CheckAvailableSlots(date string) ([]map[string]string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read calendar POST response: %w", err)
+	}
 
 	reHtml := regexp.MustCompile(`"html":"([^"]*)"`)
 	htmlMatches := reHtml.FindStringSubmatch(string(body))
@@ -198,22 +219,31 @@ func (c *Client) Book(date, timeSlot string) *Result {
 
 	if !c.sessionOK {
 		log.Printf("[DEBUG] Step 1: 访问日历页面建立 Session")
-		req, _ := http.NewRequest("GET", c.cfg.BaseURL+"/reservations/calendar", nil)
+		req, err := http.NewRequest("GET", c.cfg.BaseURL+"/reservations/calendar", nil)
+		if err != nil {
+			result.Message = fmt.Sprintf("Create calendar request failed: %v", err)
+			return result
+		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 		resp, err := c.client.Do(req)
 		if err != nil {
 			result.Message = fmt.Sprintf("Calendar page failed: %v", err)
 			return result
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if err != nil {
+			result.Message = fmt.Sprintf("Read calendar response failed: %v", err)
+			return result
+		}
 
 		reCsrf := regexp.MustCompile(`name="_csrfToken"[^>]*value="([^"]+)"`)
 		csrfMatch := reCsrf.FindStringSubmatch(string(body))
-		csrfToken := ""
-		if len(csrfMatch) > 1 {
-			csrfToken = csrfMatch[1]
+		if len(csrfMatch) < 2 {
+			result.Message = "No CSRF token on calendar page"
+			return result
 		}
+		csrfToken := csrfMatch[1]
 
 		log.Printf("[DEBUG] Step 2: 提交日历查询 event=%s, plan=%s", c.cfg.EventID, c.cfg.PlanID)
 		formData := url.Values{}
@@ -224,7 +254,11 @@ func (c *Client) Book(date, timeSlot string) *Result {
 		formData.Set("search", "exec")
 		formData.Set("_csrfToken", csrfToken)
 
-		req2, _ := http.NewRequest("POST", c.cfg.BaseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+		req2, err := http.NewRequest("POST", c.cfg.BaseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+		if err != nil {
+			result.Message = fmt.Sprintf("Create calendar query failed: %v", err)
+			return result
+		}
 		req2.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 		req2.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -258,9 +292,13 @@ func (c *Client) Book(date, timeSlot string) *Result {
 	log.Printf("[DEBUG] Option response status: %d", resp.StatusCode)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		log.Printf("[DEBUG] Option error response: %s", string(bodyBytes)[:min(500, len(bodyBytes))])
+		if readErr != nil {
+			log.Printf("[DEBUG] Option error response read failed: %v", readErr)
+		} else {
+			log.Printf("[DEBUG] Option error response: %s", string(bodyBytes)[:min(500, len(bodyBytes))])
+		}
 		result.Message = fmt.Sprintf("Option status: %d", resp.StatusCode)
 		return result
 	}
@@ -297,8 +335,12 @@ func (c *Client) Book(date, timeSlot string) *Result {
 		result.Message = fmt.Sprintf("Guest page failed: %v", err)
 		return result
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		result.Message = fmt.Sprintf("Read guest response failed: %v", err)
+		return result
+	}
 
 	reCsrf2 := regexp.MustCompile(`<input[^>]+name="_csrfToken"[^>]+value="([^"]+)"`)
 	csrfMatches := reCsrf2.FindStringSubmatch(string(body))
@@ -323,6 +365,11 @@ func (c *Client) Book(date, timeSlot string) *Result {
 		tokenUnlocked = unlockedMatches[1]
 	}
 
+	if tokenCsrf == "" || tokenFields == "" {
+		result.Message = "No form tokens on guest page"
+		return result
+	}
+
 	log.Printf("[DEBUG] Guest page tokens: CSRF=%s..., Fields=%s...",
 		tokenCsrf[:min(20, len(tokenCsrf))], tokenFields[:min(20, len(tokenFields))])
 
@@ -344,7 +391,11 @@ func (c *Client) Book(date, timeSlot string) *Result {
 	formData2.Set("_Token[fields]", tokenFields)
 	formData2.Set("_Token[unlocked]", tokenUnlocked)
 
-	postReq, _ := http.NewRequest("POST", guestURL, strings.NewReader(formData2.Encode()))
+	postReq, err := http.NewRequest("POST", guestURL, strings.NewReader(formData2.Encode()))
+	if err != nil {
+		result.Message = fmt.Sprintf("Create submit request failed: %v", err)
+		return result
+	}
 	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	postReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	postReq.Header.Set("Referer", guestURL)
@@ -374,15 +425,23 @@ func (c *Client) Book(date, timeSlot string) *Result {
 
 func (c *Client) confirm() bool {
 	log.Printf("[DEBUG] Step 6: 访问确认页面")
-	req, _ := http.NewRequest("GET", c.cfg.BaseURL+"/reservations/conf", nil)
+	req, err := http.NewRequest("GET", c.cfg.BaseURL+"/reservations/conf", nil)
+	if err != nil {
+		log.Printf("[DEBUG] Create conf request failed: %v", err)
+		return false
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return false
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		log.Printf("[DEBUG] Read conf response failed: %v", err)
+		return false
+	}
 
 	reCsrf := regexp.MustCompile(`<input[^>]+name="_csrfToken"[^>]+value="([^"]+)"`)
 	reFields := regexp.MustCompile(`<input[^>]+name="_Token\[fields\]"[^>]+value="([^"]+)"`)
@@ -392,20 +451,25 @@ func (c *Client) confirm() bool {
 	fieldsMatch := reFields.FindStringSubmatch(string(body))
 	unlockedMatch := reUnlocked.FindStringSubmatch(string(body))
 
+	if len(csrfMatch) < 2 || len(fieldsMatch) < 2 {
+		log.Printf("[DEBUG] Missing form tokens on conf page")
+		return false
+	}
+
 	payload := url.Values{}
 	payload.Set("_method", "POST")
-	if len(csrfMatch) > 1 {
-		payload.Set("_csrfToken", csrfMatch[1])
-	}
-	if len(fieldsMatch) > 1 {
-		payload.Set("_Token[fields]", fieldsMatch[1])
-	}
+	payload.Set("_csrfToken", csrfMatch[1])
+	payload.Set("_Token[fields]", fieldsMatch[1])
 	if len(unlockedMatch) > 1 {
 		payload.Set("_Token[unlocked]", unlockedMatch[1])
 	}
 
 	log.Printf("[DEBUG] Step 7: 提交确认")
-	req2, _ := http.NewRequest("POST", c.cfg.BaseURL+"/reservations/conf", strings.NewReader(payload.Encode()))
+	req2, err := http.NewRequest("POST", c.cfg.BaseURL+"/reservations/conf", strings.NewReader(payload.Encode()))
+	if err != nil {
+		log.Printf("[DEBUG] Create confirm request failed: %v", err)
+		return false
+	}
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req2.Header.Set("Referer", c.cfg.BaseURL+"/reservations/conf")

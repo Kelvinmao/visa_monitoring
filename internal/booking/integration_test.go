@@ -228,8 +228,8 @@ func TestIntegration_ExtremeOneSecondWindow(t *testing.T) {
 	// In real code this happens during PreWarm when reading the Date header.
 	// The mock server returns Date header 900ms behind, so offset = -900ms.
 	// Set it manually for test determinism.
-	serverClockOffset = -900 * time.Millisecond
-	defer func() { serverClockOffset = 0 }()
+	setServerClockOffset(-900 * time.Millisecond)
+	defer setServerClockOffset(0)
 
 	client := NewPreWarmClient(cfg, cfg.WorkerCount)
 
@@ -365,8 +365,8 @@ func TestIntegration_SlotsCloseAfterOneSecond(t *testing.T) {
 		StartEarlySec: 1,
 	}
 
-	serverClockOffset = -900 * time.Millisecond
-	defer func() { serverClockOffset = 0 }()
+	setServerClockOffset(-900 * time.Millisecond)
+	defer setServerClockOffset(0)
 
 	client := NewPreWarmClient(cfg, cfg.WorkerCount)
 	if err := client.PreWarm(cfg.TargetDate); err != nil {
@@ -471,8 +471,8 @@ func TestIntegration_NoEarlyExitCatchesReopening(t *testing.T) {
 		StartEarlySec: 1,
 	}
 
-	serverClockOffset = -900 * time.Millisecond
-	defer func() { serverClockOffset = 0 }()
+	setServerClockOffset(-900 * time.Millisecond)
+	defer setServerClockOffset(0)
 
 	client := NewPreWarmClient(cfg, cfg.WorkerCount)
 	if err := client.PreWarm(cfg.TargetDate); err != nil {
@@ -725,7 +725,10 @@ func TestIntegration_CompetitiveRivalUsers(t *testing.T) {
 				resp.Body.Close()
 				time.Sleep(stepDelay)
 
-				req, _ := http.NewRequest("POST", srv.URL+"/reservations/conf", nil)
+				req, err := http.NewRequest("POST", srv.URL+"/reservations/conf", nil)
+				if err != nil {
+					continue
+				}
 				req.Header.Set("X-Booking-Slot", slot)
 				req.Header.Set("X-Booking-Who", fmt.Sprintf("rival-%d", rivalID))
 				resp, err = client.Do(req)
@@ -757,8 +760,8 @@ func TestIntegration_CompetitiveRivalUsers(t *testing.T) {
 		StartEarlySec: 1,
 	}
 
-	serverClockOffset = -900 * time.Millisecond
-	defer func() { serverClockOffset = 0 }()
+	setServerClockOffset(-900 * time.Millisecond)
+	defer setServerClockOffset(0)
 
 	client := NewPreWarmClient(cfg, cfg.WorkerCount)
 	if err := client.PreWarm(cfg.TargetDate); err != nil {
@@ -767,7 +770,7 @@ func TestIntegration_CompetitiveRivalUsers(t *testing.T) {
 
 	// PreWarm's Date header detection overwrites serverClockOffset with
 	// second-precision value. Restore the precise test value.
-	serverClockOffset = -900 * time.Millisecond
+	setServerClockOffset(-900 * time.Millisecond)
 
 	offset := GetServerClockOffset()
 	burstStart := serverRelease.Add(-offset).Add(-time.Duration(cfg.StartEarlySec) * time.Second)
@@ -983,7 +986,8 @@ func TestIntegration_CompetitiveAgainstFastBots(t *testing.T) {
 				resp, _ = cl.Get(srv.URL + "/reservations/conf")
 				if resp != nil { resp.Body.Close() }
 
-				req, _ := http.NewRequest("POST", srv.URL+"/reservations/conf", nil)
+				req, err := http.NewRequest("POST", srv.URL+"/reservations/conf", nil)
+				if err != nil { continue }
 				req.Header.Set("X-Booking-Slot", slot)
 				req.Header.Set("X-Booking-Who", fmt.Sprintf("bot-%d", id))
 				resp, err = cl.Do(req)
@@ -1012,8 +1016,8 @@ func TestIntegration_CompetitiveAgainstFastBots(t *testing.T) {
 		StartEarlySec: 1,
 	}
 
-	serverClockOffset = -900 * time.Millisecond
-	defer func() { serverClockOffset = 0 }()
+	setServerClockOffset(-900 * time.Millisecond)
+	defer setServerClockOffset(0)
 
 	pwClient := NewPreWarmClient(cfg, cfg.WorkerCount)
 	if err := pwClient.PreWarm(cfg.TargetDate); err != nil {
@@ -1022,7 +1026,7 @@ func TestIntegration_CompetitiveAgainstFastBots(t *testing.T) {
 
 	// PreWarm's Date header detection overwrites serverClockOffset with
 	// second-precision value. Restore the precise test value.
-	serverClockOffset = -900 * time.Millisecond
+	setServerClockOffset(-900 * time.Millisecond)
 
 	offset := GetServerClockOffset()
 	burstStart := serverRelease.Add(-offset).Add(-time.Duration(cfg.StartEarlySec) * time.Second)

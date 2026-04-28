@@ -64,7 +64,7 @@ var serverClockOffset time.Duration
 // The HTTP Date header has only 1-second resolution, so a single sample has up to
 // ±1s error. Taking the MAXIMUM across many samples minimizes this bias.
 var offsetSamples []time.Duration
-var offsetMu sync.Mutex
+var offsetMu sync.RWMutex
 
 // recordOffsetSample records one server-clock-offset sample from an HTTP Date header.
 func recordOffsetSample(dateStr string) {
@@ -100,15 +100,24 @@ func finalizeOffset() {
 	// The max sample has expected error of ~1/N seconds (N=sample count).
 	// Add half of that as a small correction.
 	correction := time.Duration(float64(time.Second) / float64(2*len(offsetSamples)))
-	serverClockOffset = maxOffset + correction
+	offset := maxOffset + correction
+	serverClockOffset = offset
 	log.Printf("[CLOCK] Finalized offset: %v (from %d samples, max=%v, correction=%v)",
-		serverClockOffset.Round(time.Millisecond), len(offsetSamples),
+		offset.Round(time.Millisecond), len(offsetSamples),
 		maxOffset.Round(time.Millisecond), correction.Round(time.Millisecond))
 }
 
 // GetServerClockOffset returns the detected server-local clock difference.
 func GetServerClockOffset() time.Duration {
+	offsetMu.RLock()
+	defer offsetMu.RUnlock()
 	return serverClockOffset
+}
+
+func setServerClockOffset(offset time.Duration) {
+	offsetMu.Lock()
+	defer offsetMu.Unlock()
+	serverClockOffset = offset
 }
 
 // CalibrateServerClock fires N rapid HTTP HEAD requests to collect Date header
@@ -164,7 +173,11 @@ func NewPreWarmClient(cfg *config.Config, numWorkers int) *PreWarmClient {
 // Returns true on success.
 func (p *PreWarmClient) prewarmOneWorker(worker *PreWarmedWorker, date string) bool {
 	// Step 1: get CSRF token
-	req, _ := http.NewRequest("GET", p.baseURL+"/reservations/calendar", nil)
+	req, err := http.NewRequest("GET", p.baseURL+"/reservations/calendar", nil)
+	if err != nil {
+		log.Printf("[Worker %d] Create calendar request failed: %v", worker.id, err)
+		return false
+	}
 	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := worker.client.Do(req)
@@ -172,11 +185,14 @@ func (p *PreWarmClient) prewarmOneWorker(worker *PreWarmedWorker, date string) b
 		log.Printf("[Worker %d] Step 1 failed: %v", worker.id, err)
 		return false
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
 	// Collect server clock sample from Date header (every worker contributes)
 	recordOffsetSample(resp.Header.Get("Date"))
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		log.Printf("[Worker %d] Calendar GET read failed: %v", worker.id, err)
+		return false
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("[Worker %d] Calendar GET failed: status=%d bodyLen=%d", worker.id, resp.StatusCode, len(body))
@@ -199,7 +215,11 @@ func (p *PreWarmClient) prewarmOneWorker(worker *PreWarmedWorker, date string) b
 	formData.Set("search", "exec")
 	formData.Set("_csrfToken", worker.csrfToken)
 
-	req2, _ := http.NewRequest("POST", p.baseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	req2, err := http.NewRequest("POST", p.baseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	if err != nil {
+		log.Printf("[Worker %d] Create calendar POST request failed: %v", worker.id, err)
+		return false
+	}
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req2.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req2.Header.Set("User-Agent", userAgent)
@@ -209,8 +229,12 @@ func (p *PreWarmClient) prewarmOneWorker(worker *PreWarmedWorker, date string) b
 		log.Printf("[Worker %d] Step 2 failed: %v", worker.id, err)
 		return false
 	}
-	ajaxBody, _ := io.ReadAll(resp2.Body)
+	ajaxBody, err := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
+	if err != nil {
+		log.Printf("[Worker %d] Calendar POST read failed: %v", worker.id, err)
+		return false
+	}
 
 	if worker.id == 0 {
 		log.Printf("[Worker 0] PreWarm session response: status=%d bodyLen=%d body=%q",
@@ -240,7 +264,13 @@ func (p *PreWarmClient) prewarmOneWorker(worker *PreWarmedWorker, date string) b
 // normal GET-then-POST flow during burst.
 func (p *PreWarmClient) prefetchGuestTokens(worker *PreWarmedWorker) {
 	guestURL := p.baseURL + "/reservations/user/guest"
-	req, _ := http.NewRequest("GET", guestURL, nil)
+	req, err := http.NewRequest("GET", guestURL, nil)
+	if err != nil {
+		if worker.id == 0 {
+			log.Printf("[PREFETCH] worker=%d create guest request failed: %v", worker.id, err)
+		}
+		return
+	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", p.baseURL+"/reservations/calendar")
 
@@ -251,8 +281,14 @@ func (p *PreWarmClient) prefetchGuestTokens(worker *PreWarmedWorker) {
 		}
 		return
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		if worker.id == 0 {
+			log.Printf("[PREFETCH] worker=%d guest read failed: %v", worker.id, err)
+		}
+		return
+	}
 
 	if resp.StatusCode != 200 {
 		if worker.id == 0 {
@@ -303,7 +339,13 @@ func (p *PreWarmClient) prefetchGuestTokens(worker *PreWarmedWorker) {
 // If successful, quickConfirm can skip GET conf and POST directly.
 func (p *PreWarmClient) prefetchConfTokens(worker *PreWarmedWorker) {
 	confURL := p.baseURL + "/reservations/conf"
-	req, _ := http.NewRequest("GET", confURL, nil)
+	req, err := http.NewRequest("GET", confURL, nil)
+	if err != nil {
+		if worker.id == 0 {
+			log.Printf("[PREFETCH-CONF] worker=%d create request failed: %v", worker.id, err)
+		}
+		return
+	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", p.baseURL+"/reservations/user/guest")
 
@@ -314,8 +356,14 @@ func (p *PreWarmClient) prefetchConfTokens(worker *PreWarmedWorker) {
 		}
 		return
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		if worker.id == 0 {
+			log.Printf("[PREFETCH-CONF] worker=%d read failed: %v", worker.id, err)
+		}
+		return
+	}
 
 	if resp.StatusCode != 200 {
 		if worker.id == 0 {
@@ -572,9 +620,14 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				}
 
 				if resp.StatusCode == 200 {
-					optBody, _ := io.ReadAll(resp.Body)
+					optBody, readErr := io.ReadAll(resp.Body)
 					resp.Body.Close()
 					cancel()
+					if readErr != nil {
+						log.Printf("[QUICKBURST] worker=%d option body read failed for slot=%s: %v", w.id, mySlot, readErr)
+						currentIdx++
+						continue
+					}
 					guestURL := p.submitOptionPage(w, optBody)
 					log.Printf("[QUICKBURST] worker=%d GOT 200 for slot=%s → submitting", w.id, mySlot)
 					result := p.quickSubmit(w, guestURL, date, mySlot)
@@ -780,14 +833,14 @@ func (p *PreWarmClient) submitOptionPage(worker *PreWarmedWorker, body []byte) s
 	formData := url.Values{}
 	formData.Set("_method", "POST")
 	formData.Set("_csrfToken", csrf)
-	if fields != "" {
-		formData.Set("_Token[fields]", fields)
-	}
-	if unlocked != "" {
-		formData.Set("_Token[unlocked]", unlocked)
-	}
+	formData.Set("_Token[fields]", fields)
+	formData.Set("_Token[unlocked]", unlocked)
 
-	req, _ := http.NewRequest("POST", actionURL, strings.NewReader(formData.Encode()))
+	req, err := http.NewRequest("POST", actionURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		log.Printf("[OPTIONPAGE] worker=%d create option POST failed: %v", worker.id, err)
+		return defaultGuestURL
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Origin", p.baseURL)
@@ -829,7 +882,11 @@ func (p *PreWarmClient) buildGuestBody(worker *PreWarmedWorker, guestURL string)
 	// Slow path: GET guest page for fresh tokens
 	log.Printf("[QUICKSUBMIT] worker=%d GET guest page: %s", worker.id, guestURL)
 	guestStart := time.Now()
-	req, _ := http.NewRequest("GET", guestURL, nil)
+	req, err := http.NewRequest("GET", guestURL, nil)
+	if err != nil {
+		log.Printf("[QUICKSUBMIT] worker=%d create guest GET failed: %v", worker.id, err)
+		return ""
+	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", p.baseURL+"/reservations/option")
 
@@ -838,8 +895,12 @@ func (p *PreWarmClient) buildGuestBody(worker *PreWarmedWorker, guestURL string)
 		log.Printf("[QUICKSUBMIT] worker=%d guest GET error: %v", worker.id, err)
 		return ""
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		log.Printf("[QUICKSUBMIT] worker=%d guest body read failed: %v", worker.id, err)
+		return ""
+	}
 	log.Printf("[QUICKSUBMIT] worker=%d guest GET status=%d bodyLen=%d latency=%v",
 		worker.id, resp.StatusCode, len(body), time.Since(guestStart).Round(time.Millisecond))
 
@@ -883,7 +944,10 @@ func (p *PreWarmClient) quickSubmit(worker *PreWarmedWorker, guestURL, date, tim
 		return &Result{Success: false, Message: "Failed to build guest form body"}
 	}
 
-	req2, _ := http.NewRequest("POST", guestURL, strings.NewReader(encodedBody))
+	req2, err := http.NewRequest("POST", guestURL, strings.NewReader(encodedBody))
+	if err != nil {
+		return &Result{Success: false, Message: fmt.Sprintf("Create guest POST failed: %v", err)}
+	}
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req2.Header.Set("User-Agent", userAgent)
 	req2.Header.Set("Origin", p.baseURL)
@@ -895,8 +959,11 @@ func (p *PreWarmClient) quickSubmit(worker *PreWarmedWorker, guestURL, date, tim
 		log.Printf("[QUICKSUBMIT] worker=%d POST guest error: %v", worker.id, err)
 		return &Result{Success: false, Message: fmt.Sprintf("Submit failed: %v", err)}
 	}
-	body2, _ := io.ReadAll(resp2.Body)
+	body2, readErr := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
+	if readErr != nil {
+		log.Printf("[QUICKSUBMIT] worker=%d POST guest body read failed: %v", worker.id, readErr)
+	}
 	log.Printf("[QUICKSUBMIT] worker=%d POST guest status=%d latency=%v",
 		worker.id, resp2.StatusCode, time.Since(submitStart).Round(time.Millisecond))
 
@@ -928,7 +995,11 @@ func (p *PreWarmClient) quickConfirm(worker *PreWarmedWorker, timeSlot string) *
 		formData.Set("_Token[fields]", worker.confFields)
 		formData.Set("_Token[unlocked]", worker.confUnlocked)
 
-		req, _ := http.NewRequest("POST", confURL, strings.NewReader(formData.Encode()))
+		req, err := http.NewRequest("POST", confURL, strings.NewReader(formData.Encode()))
+		if err != nil {
+			log.Printf("[QUICKCONFIRM] worker=%d create cached conf POST failed: %v", worker.id, err)
+			goto slowPath
+		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Origin", p.baseURL)
@@ -962,7 +1033,11 @@ slowPath:
 	log.Printf("[QUICKCONFIRM] worker=%d GET conf page for slot=%s", worker.id, timeSlot)
 	confStart := time.Now()
 
-	req, _ := http.NewRequest("GET", confURL, nil)
+	req, err := http.NewRequest("GET", confURL, nil)
+	if err != nil {
+		log.Printf("[QUICKCONFIRM] worker=%d create conf GET failed: %v", worker.id, err)
+		return &Result{Success: false, Message: fmt.Sprintf("Create conf GET failed: %v", err)}
+	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", p.baseURL+"/reservations/user/guest")
 
@@ -971,8 +1046,12 @@ slowPath:
 		log.Printf("[QUICKCONFIRM] worker=%d conf GET error: %v", worker.id, err)
 		return &Result{Success: false, Message: fmt.Sprintf("Conf failed: %v", err)}
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		log.Printf("[QUICKCONFIRM] worker=%d conf body read failed: %v", worker.id, err)
+		return &Result{Success: false, Message: fmt.Sprintf("Read conf response failed: %v", err)}
+	}
 	log.Printf("[QUICKCONFIRM] worker=%d conf GET status=%d bodyLen=%d latency=%v",
 		worker.id, resp.StatusCode, len(body), time.Since(confStart).Round(time.Millisecond))
 
@@ -993,7 +1072,11 @@ slowPath:
 	formData.Set("_Token[fields]", tokenFields)
 	formData.Set("_Token[unlocked]", tokenUnlocked)
 
-	req2, _ := http.NewRequest("POST", confURL, strings.NewReader(formData.Encode()))
+	req2, err := http.NewRequest("POST", confURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		log.Printf("[QUICKCONFIRM] worker=%d create conf POST failed: %v", worker.id, err)
+		return &Result{Success: false, Message: fmt.Sprintf("Create confirm request failed: %v", err)}
+	}
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req2.Header.Set("User-Agent", userAgent)
 	req2.Header.Set("Origin", p.baseURL)
@@ -1005,8 +1088,11 @@ slowPath:
 		log.Printf("[QUICKCONFIRM] worker=%d conf POST error: %v", worker.id, err)
 		return &Result{Success: false, Message: fmt.Sprintf("Confirm failed: %v", err)}
 	}
-	body2, _ := io.ReadAll(resp2.Body)
+	body2, readErr := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
+	if readErr != nil {
+		log.Printf("[QUICKCONFIRM] worker=%d conf POST body read failed: %v", worker.id, readErr)
+	}
 	log.Printf("[QUICKCONFIRM] worker=%d conf POST status=%d latency=%v",
 		worker.id, resp2.StatusCode, time.Since(confPostStart).Round(time.Millisecond))
 
@@ -1075,11 +1161,17 @@ func (p *PreWarmClient) KeepAlive(stop <-chan struct{}) {
 					wg.Add(1)
 					go func(w *PreWarmedWorker) {
 						defer wg.Done()
-						req, _ := http.NewRequest("GET", p.baseURL+"/reservations/calendar", nil)
+						req, err := http.NewRequest("GET", p.baseURL+"/reservations/calendar", nil)
+						if err != nil {
+							log.Printf("[KEEPALIVE] worker=%d create request failed: %v", w.id, err)
+							return
+						}
 						req.Header.Set("User-Agent", userAgent)
 						resp, err := w.client.Do(req)
 						if err == nil {
 							drainBody(resp)
+						} else {
+							log.Printf("[KEEPALIVE] worker=%d request failed: %v", w.id, err)
 						}
 					}(worker)
 				}
@@ -1104,7 +1196,11 @@ func (p *PreWarmClient) ProbeSlots(date string) {
 		optionURL := fmt.Sprintf("%s/reservations/option?event_id=%s&event_plan_id=%s&date=%s&time_from=%s",
 			p.baseURL, p.cfg.EventID, p.cfg.PlanID, url.QueryEscape(date), url.QueryEscape(slot))
 
-		req, _ := http.NewRequest("GET", optionURL, nil)
+		req, err := http.NewRequest("GET", optionURL, nil)
+		if err != nil {
+			log.Printf("[PROBE] slot=%s create request failed: %v", slot, err)
+			continue
+		}
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Referer", p.baseURL+"/reservations/calendar")
 
@@ -1113,8 +1209,12 @@ func (p *PreWarmClient) ProbeSlots(date string) {
 			log.Printf("[PROBE] slot=%s error=%v", slot, err)
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if readErr != nil {
+			log.Printf("[PROBE] slot=%s body read failed: %v", slot, readErr)
+			continue
+		}
 
 		if resp.StatusCode == 302 {
 			log.Printf("[PROBE] slot=%s status=302 location=%s", slot, resp.Header.Get("Location"))

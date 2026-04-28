@@ -1,15 +1,13 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"flag"
 	"log"
-	"net/http"
 	"time"
 
 	"visa_monitor/internal/booking"
 	"visa_monitor/internal/config"
+	"visa_monitor/internal/notify"
 )
 
 func main() {
@@ -88,7 +86,9 @@ func sendNotification(cfg *config.Config, result *booking.Result) {
 		"time_slot": result.TimeSlot,
 		"message":   result.Message,
 	}
-	data, _ := json.Marshal(payload)
-	http.Post(cfg.WebhookURL, "application/json", bytes.NewReader(data))
+	if err := notify.SendJSON(cfg.WebhookURL, payload); err != nil {
+		log.Printf("[NOTIFY] Webhook failed: %v", err)
+		return
+	}
 	log.Printf("[NOTIFY] Webhook sent")
 }

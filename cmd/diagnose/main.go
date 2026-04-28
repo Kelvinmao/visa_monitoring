@@ -40,14 +40,13 @@ func main() {
 
 	// Step 1: GET calendar page for CSRF
 	log.Println("=== Step 1: GET calendar ===")
-	req, _ := http.NewRequest("GET", baseURL+"/reservations/calendar", nil)
+	req := mustNewRequest("GET", baseURL+"/reservations/calendar", nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Fatalf("Step 1 failed: %v", err)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	body := mustReadBody("Step 1", resp)
 	log.Printf("Status: %d, BodyLen: %d", resp.StatusCode, len(body))
 
 	csrf, _, _ := booking.ExtractFormTokensPublic(string(body))
@@ -63,7 +62,7 @@ func main() {
 	formData.Set("search", "exec")
 	formData.Set("_csrfToken", csrf)
 
-	req2, _ := http.NewRequest("POST", baseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
+	req2 := mustNewRequest("POST", baseURL+"/ajax/reservations/calendar", strings.NewReader(formData.Encode()))
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req2.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req2.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -71,23 +70,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("Step 2 failed: %v", err)
 	}
-	body2, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
+	body2 := mustReadBody("Step 2", resp2)
 	log.Printf("Status: %d, BodyLen: %d", resp2.StatusCode, len(body2))
 
 	// Step 3: GET option page
 	log.Println("=== Step 3: GET option ===")
 	optionURL := fmt.Sprintf("%s/reservations/option?event_id=%s&event_plan_id=%s&date=%s&time_from=%s",
 		baseURL, cfg.EventID, cfg.PlanID, url.QueryEscape(date), url.QueryEscape(slot))
-	req3, _ := http.NewRequest("GET", optionURL, nil)
+	req3 := mustNewRequest("GET", optionURL, nil)
 	req3.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req3.Header.Set("Referer", baseURL+"/reservations/calendar")
 	resp3, err := client.Do(req3)
 	if err != nil {
 		log.Fatalf("Step 3 failed: %v", err)
 	}
-	body3, _ := io.ReadAll(resp3.Body)
-	resp3.Body.Close()
+	body3 := mustReadBody("Step 3", resp3)
 	log.Printf("Status: %d, BodyLen: %d", resp3.StatusCode, len(body3))
 	if resp3.StatusCode == 302 {
 		loc := resp3.Header.Get("Location")
@@ -97,15 +94,13 @@ func main() {
 		if !strings.HasPrefix(loc, "http") {
 			loc = baseURL + loc
 		}
-		req3b, _ := http.NewRequest("GET", loc, nil)
+		req3b := mustNewRequest("GET", loc, nil)
 		req3b.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 		resp3b, err := client.Do(req3b)
 		if err != nil {
 			log.Fatalf("Step 3b (follow redirect) failed: %v", err)
 		}
-		body3 = nil
-		body3, _ = io.ReadAll(resp3b.Body)
-		resp3b.Body.Close()
+		body3 = mustReadBody("Step 3b", resp3b)
 		log.Printf("After redirect - Status: %d, BodyLen: %d", resp3b.StatusCode, len(body3))
 	}
 
@@ -125,7 +120,7 @@ func main() {
 		if unlockedOpt != "" {
 			optForm.Set("_Token[unlocked]", unlockedOpt)
 		}
-		req3c, _ := http.NewRequest("POST", baseURL+"/reservations/option", strings.NewReader(optForm.Encode()))
+		req3c := mustNewRequest("POST", baseURL+"/reservations/option", strings.NewReader(optForm.Encode()))
 		req3c.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req3c.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 		req3c.Header.Set("Origin", baseURL)
@@ -133,8 +128,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Step 3c failed: %v", err)
 		}
-		body3c, _ := io.ReadAll(resp3c.Body)
-		resp3c.Body.Close()
+		body3c := mustReadBody("Step 3c", resp3c)
 		log.Printf("Status: %d, BodyLen: %d", resp3c.StatusCode, len(body3c))
 		if resp3c.StatusCode == 302 {
 			log.Printf("Redirect: %s", resp3c.Header.Get("Location"))
@@ -144,15 +138,14 @@ func main() {
 	// Step 4: GET guest page
 	log.Println("=== Step 4: GET guest page ===")
 	guestURL := baseURL + "/reservations/user/guest"
-	req4, _ := http.NewRequest("GET", guestURL, nil)
+	req4 := mustNewRequest("GET", guestURL, nil)
 	req4.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req4.Header.Set("Referer", baseURL+"/reservations/option")
 	resp4, err := client.Do(req4)
 	if err != nil {
 		log.Fatalf("Step 4 failed: %v", err)
 	}
-	body4, _ := io.ReadAll(resp4.Body)
-	resp4.Body.Close()
+	body4 := mustReadBody("Step 4", resp4)
 	log.Printf("Status: %d, BodyLen: %d", resp4.StatusCode, len(body4))
 
 	if resp4.StatusCode == 302 {
@@ -197,7 +190,7 @@ func main() {
 		log.Printf("  %s = %s", k, v[0])
 	}
 
-	req5, _ := http.NewRequest("POST", guestURL, strings.NewReader(guestForm.Encode()))
+	req5 := mustNewRequest("POST", guestURL, strings.NewReader(guestForm.Encode()))
 	req5.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req5.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req5.Header.Set("Origin", baseURL)
@@ -207,8 +200,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Step 5 failed: %v", err)
 	}
-	body5, _ := io.ReadAll(resp5.Body)
-	resp5.Body.Close()
+	body5 := mustReadBody("Step 5", resp5)
 	log.Printf("Status: %d, BodyLen: %d", resp5.StatusCode, len(body5))
 	if resp5.StatusCode == 302 {
 		log.Printf("Redirect: %s — SUCCESS, guest form accepted!", resp5.Header.Get("Location"))
@@ -217,6 +209,23 @@ func main() {
 		_ = writeFile("/tmp/guest_response.html", body5)
 		fmt.Println(string(body5[:min5(3000, len(body5))]))
 	}
+}
+
+func mustNewRequest(method, requestURL string, body io.Reader) *http.Request {
+	req, err := http.NewRequest(method, requestURL, body)
+	if err != nil {
+		log.Fatalf("Create %s request failed for %s: %v", method, requestURL, err)
+	}
+	return req
+}
+
+func mustReadBody(step string, resp *http.Response) []byte {
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		log.Fatalf("%s response read failed: %v", step, err)
+	}
+	return body
 }
 
 func writeFile(path string, data []byte) error {

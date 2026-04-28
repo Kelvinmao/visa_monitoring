@@ -198,7 +198,11 @@ func main() {
 						Timeout: 5 * time.Second,
 					}
 
-					req, _ := http.NewRequest("GET", optionURL, nil)
+					req, err := http.NewRequest("GET", optionURL, nil)
+					if err != nil {
+						log.Printf("[COMPETITOR %d] create request failed: %v", id, err)
+						return
+					}
 					req.Header.Set("User-Agent", fmt.Sprintf("CompetitorBot/%d", id))
 
 					resp, err := client.Do(req)
