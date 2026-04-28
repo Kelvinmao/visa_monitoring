@@ -81,6 +81,12 @@ func recordOffsetSample(dateStr string) {
 	offsetMu.Unlock()
 }
 
+func resetOffsetSamples() {
+	offsetMu.Lock()
+	defer offsetMu.Unlock()
+	offsetSamples = nil
+}
+
 // finalizeOffset computes the best offset estimate from all collected samples.
 // Because Date headers truncate to seconds, each sample underestimates the true offset
 // by a random amount in [0, 1s). The maximum sample is closest to reality.
@@ -118,12 +124,14 @@ func setServerClockOffset(offset time.Duration) {
 	offsetMu.Lock()
 	defer offsetMu.Unlock()
 	serverClockOffset = offset
+	offsetSamples = nil
 }
 
 // CalibrateServerClock fires N rapid HTTP HEAD requests to collect Date header
 // samples and refines the server clock offset. Call this after prewarm and
 // shortly before burst for maximum accuracy.
 func CalibrateServerClock(baseURL string, n int) {
+	resetOffsetSamples()
 	client := &http.Client{Timeout: 5 * time.Second}
 	for i := 0; i < n; i++ {
 		resp, err := client.Head(baseURL + "/reservations/calendar")
@@ -399,6 +407,7 @@ func (p *PreWarmClient) PreWarm(date string) error {
 	const maxRetries = 5
 	const retryDelay = 10 * time.Second
 
+	resetOffsetSamples()
 	log.Printf("[PREWARM] Warming up %d workers (batch=%d, delay=%v)...", len(p.clients), batchSize, batchDelay)
 
 	var successCount int32

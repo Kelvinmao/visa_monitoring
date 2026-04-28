@@ -220,7 +220,14 @@ func (a *AggressiveClient) initWorkerSession(w *aggressiveWorker, date string) e
 	if err != nil {
 		return err
 	}
+	postBody, err := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
+	if err != nil {
+		return fmt.Errorf("read calendar POST response: %w", err)
+	}
+	if resp2.StatusCode < 200 || resp2.StatusCode >= 300 {
+		return fmt.Errorf("calendar POST failed: status=%d body=%q", resp2.StatusCode, shortBody(postBody))
+	}
 	return nil
 }
 
@@ -297,9 +304,16 @@ func (a *AggressiveClient) workerLoop(w *aggressiveWorker, date, timeSlot string
 		}
 
 		if resp.StatusCode == 200 {
-			// Slot available — option page loaded, proceed to guest
+			// Slot available — option page loaded, submit any option form
+			// before proceeding so the selected slot is bound to the session.
+			optionBody, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			guestURL := a.baseURL + "/reservations/user/guest"
+			if readErr != nil {
+				log.Printf("[Worker %d] Read option page failed: %v", w.id, readErr)
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			guestURL := a.submitOptionPage(w, optionBody)
 			result := a.submitBooking(w.client, guestURL, timeSlot)
 			if result.Success {
 				select {
@@ -329,6 +343,69 @@ func (a *AggressiveClient) workerLoop(w *aggressiveWorker, date, timeSlot string
 			time.Sleep(2 * time.Millisecond)
 		}
 	}
+}
+
+func (a *AggressiveClient) submitOptionPage(w *aggressiveWorker, body []byte) string {
+	defaultGuestURL := a.baseURL + "/reservations/user/guest"
+	html := string(body)
+
+	csrf, fields, unlocked := extractFormTokens(html)
+	if csrf == "" {
+		log.Printf("[AGG-OPTIONPAGE] worker=%d no CSRF token on option page (bodyLen=%d), going direct to guest", w.id, len(body))
+		return defaultGuestURL
+	}
+
+	actionURL := a.baseURL + "/reservations/option"
+	if m := reFormAction.FindStringSubmatch(html); len(m) > 1 && m[1] != "" {
+		action := m[1]
+		switch {
+		case strings.HasPrefix(action, "http"):
+			actionURL = action
+		case strings.HasPrefix(action, "/"):
+			actionURL = a.baseURL + action
+		default:
+			actionURL = a.baseURL + "/" + action
+		}
+	}
+
+	formData := url.Values{}
+	formData.Set("_method", "POST")
+	formData.Set("_csrfToken", csrf)
+	formData.Set("_Token[fields]", fields)
+	formData.Set("_Token[unlocked]", unlocked)
+
+	req, err := http.NewRequest("POST", actionURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		log.Printf("[AGG-OPTIONPAGE] worker=%d create option POST failed: %v", w.id, err)
+		return defaultGuestURL
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Origin", a.baseURL)
+	req.Header.Set("Referer", actionURL)
+
+	start := time.Now()
+	resp, err := w.client.Do(req)
+	if err != nil {
+		log.Printf("[AGG-OPTIONPAGE] worker=%d option POST error: %v", w.id, err)
+		return defaultGuestURL
+	}
+
+	location := ""
+	if resp.StatusCode == 302 {
+		location = resp.Header.Get("Location")
+	}
+	drainBody(resp)
+	log.Printf("[AGG-OPTIONPAGE] worker=%d option POST status=%d location=%q latency=%v",
+		w.id, resp.StatusCode, location, time.Since(start).Round(time.Millisecond))
+
+	if location != "" {
+		if !strings.HasPrefix(location, "http") {
+			return a.baseURL + location
+		}
+		return location
+	}
+	return defaultGuestURL
 }
 
 func (a *AggressiveClient) submitBooking(client *http.Client, guestURL, timeSlot string) *Result {
