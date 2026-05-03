@@ -8,7 +8,7 @@
   "email": "kaining+account_3@layer6.ai",
   "release_hour": 9,
   "release_minute": 0,
-  "start_early_sec": 30,
+  "start_early_sec": 5,
   "burst_duration_min": 30,
-  "worker_count": 300
+  "worker_count": 30
 }

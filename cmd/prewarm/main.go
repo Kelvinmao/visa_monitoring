@@ -117,11 +117,14 @@ func main() {
 	}
 
 	// Now spawn QuickBurst — goroutines will sleep (not busy-wait) until burstStart
+	// Adjust releaseTime by clock offset so QuickBurst's barrier fires at the
+	// correct local instant (same adjustment applied to burstStart above).
+	adjustedRelease := releaseTime.Add(-clockOffset)
 	log.Printf("[MAIN] Spawning QuickBurst at %s (%.1fs before burst)",
 		time.Now().Format("15:04:05.000"), time.Until(burstStart).Seconds())
 	done := make(chan *booking.Result, 1)
 	go func() {
-		done <- client.QuickBurst(cfg.TargetDate, burstStart)
+		done <- client.QuickBurst(cfg.TargetDate, burstStart, adjustedRelease)
 	}()
 
 	// Sleep main goroutine until burstStart

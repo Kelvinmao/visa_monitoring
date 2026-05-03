@@ -262,7 +262,7 @@ func TestIntegration_ExtremeOneSecondWindow(t *testing.T) {
 	t.Logf("Expected first request arrival at server: ~%s", burstStart.Add(offset).Format("15:04:05.000"))
 
 	// Run QuickBurst
-	result := client.QuickBurst(cfg.TargetDate, burstStart)
+	result := client.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
 
 	// Analyze results
 	totalOpts := atomic.LoadInt64(&mock.totalOptionReqs)
@@ -380,7 +380,7 @@ func TestIntegration_SlotsCloseAfterOneSecond(t *testing.T) {
 		serverRelease.Format("15:04:05.000"), cutoffTime.Format("15:04:05.000"))
 	t.Logf("Burst start: %s", burstStart.Format("15:04:05.000"))
 
-	result := client.QuickBurst(cfg.TargetDate, burstStart)
+	result := client.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
 
 	totalOpts := atomic.LoadInt64(&mock.totalOptionReqs)
 	t.Logf("Total option requests: %d", totalOpts)
@@ -487,7 +487,7 @@ func TestIntegration_NoEarlyExitCatchesReopening(t *testing.T) {
 		reopenTime.Format("15:04:05.000"),
 		closeFinalTime.Format("15:04:05.000"))
 
-	result := client.QuickBurst(cfg.TargetDate, burstStart)
+	result := client.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
 
 	reqs := atomic.LoadInt64(&optionReqs)
 	t.Logf("Total option requests: %d", reqs)
@@ -780,7 +780,7 @@ func TestIntegration_CompetitiveRivalUsers(t *testing.T) {
 		numSlots, capacityPerSlot, numSlots*capacityPerSlot)
 	t.Logf("Burst start: %s (%.1fs from now)", burstStart.Format("15:04:05.000"), time.Until(burstStart).Seconds())
 
-	result := client.QuickBurst(cfg.TargetDate, burstStart)
+	result := client.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
 
 	// Wait for all rivals to finish
 	rivalWg.Wait()
@@ -1035,7 +1035,7 @@ func TestIntegration_CompetitiveAgainstFastBots(t *testing.T) {
 		numRivals, serverLatencyMs, cfg.WorkerCount)
 	t.Logf("Release: %s | Burst: %s", serverRelease.Format("15:04:05.000"), burstStart.Format("15:04:05.000"))
 
-	result := pwClient.QuickBurst(cfg.TargetDate, burstStart)
+	result := pwClient.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
 	rivalWg.Wait()
 
 	ours := atomic.LoadInt64(&ourBookings)

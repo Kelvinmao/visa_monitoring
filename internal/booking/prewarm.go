@@ -484,11 +484,18 @@ type firstReqProfile struct {
 // QuickBurst fires all pre-warmed workers simultaneously.
 // Workers are assigned dedicated slot(s) so each slot gets maximum polling frequency.
 // burstStart: exact time when workers should start firing (goroutines sleep then busy-wait).
-func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
+// releaseTime: the server's expected release instant. If non-zero, workers stop issuing
+// new pre-release requests 2s before release (the "freeze window"), wait at a barrier,
+// then all fire fresh requests simultaneously at releaseTime. Pre-release requests use a
+// 1.5s timeout (they only get 400s), so the 2s freeze window guarantees every in-flight
+// request completes before releaseTime. If releaseTime is zero, no snipe is used.
+func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time, releaseTime time.Time) *Result {
 	slots := GetTimeSlots()
 	results := make(chan *Result, 1)
 	var stopFlag int32
 	var wg sync.WaitGroup
+
+	snipeEnabled := !releaseTime.IsZero() && releaseTime.After(burstStart)
 
 	var activeCount int32
 	for _, w := range p.clients {
@@ -500,6 +507,10 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 		activeCount, len(slots), burstStart.Format("15:04:05.000"), p.cfg.BurstDuration)
 	log.Printf("[QUICKBURST] All workers fire at burstStart (rapid-retry mode, no stagger)")
 	log.Printf("[QUICKBURST] Time until burst: %v", time.Until(burstStart).Round(time.Millisecond))
+	if snipeEnabled {
+		log.Printf("[QUICKBURST] Release snipe at %s (barrier + synchronised fire)",
+			releaseTime.Format("15:04:05.000"))
+	}
 
 	var requestCount int64
 	var lastLogNano int64
@@ -508,6 +519,8 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 	var status400 int64
 	var statusOther int64
 	var statusErr int64
+	var outsidePeriodSeen int64  // tracks "受付期間外" responses
+	var phaseChanged int32       // 0 = still outside period, 1 = server opened
 
 	// Track full-rotation failures for early exit.
 	type slotState struct {
@@ -579,7 +592,34 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				}
 
 				pbSlot := prebuiltSlots[currentIdx%len(slots)]
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				// Barrier-based synchronised snipe. The freeze window (2s)
+				// exceeds the pre-release request timeout (1.5s), so any
+				// in-flight request from the previous iteration is guaranteed
+				// to have completed before releaseTime. Workers that reach this
+				// point within the freeze window sleep+busy-wait until release.
+				const preReleaseFreezeWindow = 2 * time.Second
+				const preReleaseTimeout = 1500 * time.Millisecond
+				inPreRelease := snipeEnabled && time.Now().Before(releaseTime)
+				if inPreRelease {
+					untilRelease := time.Until(releaseTime)
+					if untilRelease > 0 && untilRelease <= preReleaseFreezeWindow {
+						// Freeze: wait until releaseTime
+						if untilRelease > time.Millisecond {
+							time.Sleep(untilRelease - time.Millisecond)
+						}
+						for time.Now().Before(releaseTime) {
+							// sub-ms busy-wait
+						}
+						inPreRelease = false // now past release
+					}
+				}
+				var reqTimeout time.Duration
+				if inPreRelease {
+					reqTimeout = preReleaseTimeout
+				} else {
+					reqTimeout = 3 * time.Second
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
 				req, reqErr := http.NewRequestWithContext(ctx, "GET", pbSlot.optionURL, nil)
 				if reqErr != nil {
 					atomic.AddInt64(&statusErr, 1)
@@ -610,7 +650,10 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				}
 
 				if err != nil {
-					atomic.AddInt64(&statusErr, 1)
+					errCount := atomic.AddInt64(&statusErr, 1)
+					if errCount <= 5 || errCount%200 == 0 {
+						log.Printf("[QUICKBURST] worker=%d request error (%d total): %v", w.id, errCount, err)
+					}
 					cancel()
 					continue
 				}
@@ -629,6 +672,11 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 				}
 
 				if resp.StatusCode == 200 {
+					if atomic.CompareAndSwapInt32(&phaseChanged, 0, 1) {
+						outsideCount := atomic.LoadInt64(&outsidePeriodSeen)
+						log.Printf("[QUICKBURST] *** SERVER OPENED *** first 200 at t+%v (after %d outside-period responses, %d total reqs)",
+							time.Since(burstStart).Round(time.Millisecond), outsideCount, count)
+					}
 					optBody, readErr := io.ReadAll(resp.Body)
 					resp.Body.Close()
 					cancel()
@@ -650,6 +698,11 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 					}
 					currentIdx++
 				} else if resp.StatusCode == 302 {
+					if atomic.CompareAndSwapInt32(&phaseChanged, 0, 1) {
+						outsideCount := atomic.LoadInt64(&outsidePeriodSeen)
+						log.Printf("[QUICKBURST] *** SERVER OPENED *** first 302 at t+%v (after %d outside-period responses, %d total reqs)",
+							time.Since(burstStart).Round(time.Millisecond), outsideCount, count)
+					}
 					location := resp.Header.Get("Location")
 					drainBody(resp)
 					cancel()
@@ -679,6 +732,12 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 					}
 
 					if strings.Contains(bodyStr, "上限に達した") {
+						// Log the exact moment the server transitions from "outside period" to "capacity full"
+						if atomic.CompareAndSwapInt32(&phaseChanged, 0, 1) {
+							outsideCount := atomic.LoadInt64(&outsidePeriodSeen)
+							log.Printf("[QUICKBURST] *** SERVER OPENED *** first non-受付期間外 response at t+%v (after %d outside-period responses, %d total reqs)",
+								time.Since(burstStart).Round(time.Millisecond), outsideCount, count)
+						}
 						slotMu.Lock()
 						slotStates[currentIdx%len(slots)].capacityFull++
 						allFull := true
@@ -705,6 +764,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
 					}
 
 					if strings.Contains(bodyStr, "予約できません") || strings.Contains(bodyStr, "受付期間外") {
+						atomic.AddInt64(&outsidePeriodSeen, 1)
 						continue
 					}
 

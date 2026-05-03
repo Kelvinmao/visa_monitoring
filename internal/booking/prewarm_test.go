@@ -108,7 +108,7 @@ func TestQuickBurstRotatesSlotsAndSucceeds(t *testing.T) {
 	client := NewPreWarmClient(cfg, 1)
 	client.clients[0].csrfToken = "ready"
 
-	res := client.QuickBurst(cfg.TargetDate, time.Now())
+	res := client.QuickBurst(cfg.TargetDate, time.Now(), time.Time{})
 	if !res.Success {
 		t.Fatalf("expected success, got: %+v", res)
 	}
@@ -288,7 +288,7 @@ func TestQuickBurstMultiWorkerOnlyOneResult(t *testing.T) {
 		w.csrfToken = "ready"
 	}
 
-	res := client.QuickBurst(cfg.TargetDate, time.Now())
+	res := client.QuickBurst(cfg.TargetDate, time.Now(), time.Time{})
 	if !res.Success {
 		t.Fatalf("expected success with 8 workers, got: %+v", res)
 	}
@@ -339,7 +339,7 @@ func TestQuickBurstNonGuestRedirectContinues(t *testing.T) {
 	client := NewPreWarmClient(cfg, 1)
 	client.clients[0].csrfToken = "ready"
 
-	res := client.QuickBurst(cfg.TargetDate, time.Now())
+	res := client.QuickBurst(cfg.TargetDate, time.Now(), time.Time{})
 	if !res.Success {
 		t.Fatalf("expected success after non-guest redirects, got: %+v", res)
 	}
@@ -403,5 +403,111 @@ func TestPreWarmNoCSRFReturnsError(t *testing.T) {
 		if w.csrfToken != "" {
 			t.Errorf("worker %d should have empty token, got %q", i, w.csrfToken)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 10. Snipe barrier: workers synchronize at release time
+// ---------------------------------------------------------------------------
+func TestQuickBurstSnipeBarrierSynchronizesWorkers(t *testing.T) {
+	const numWorkers = 4
+
+	// Track the first post-release request timestamp from each worker.
+	// The mock server responds slowly (200ms) to pre-release option requests
+	// (returning 400 "受付期間外"), then quickly returns 200 after release.
+	releaseTime := time.Now().Add(3 * time.Second)
+	var firstPostRelease sync.Map // workerIdx → time.Time
+	var postReleaseCount int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/reservations/option":
+			now := time.Now()
+			if now.Before(releaseTime) {
+				// Simulate slow pre-release response
+				time.Sleep(200 * time.Millisecond)
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `<html><title>受付期間外のため予約できません</title></html>`)
+				return
+			}
+			// Post-release: record arrival time, then return success
+			idx := atomic.AddInt32(&postReleaseCount, 1)
+			firstPostRelease.LoadOrStore(int(idx), now)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/reservations/user/guest":
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<input name="_csrfToken" value="c"><input name="_Token[fields]" value="f"><input name="_Token[unlocked]" value="u">`)
+		case r.Method == http.MethodPost && r.URL.Path == "/reservations/user/guest":
+			w.Header().Set("Location", "/reservations/conf")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/reservations/conf":
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<input name="_csrfToken" value="c2"><input name="_Token[fields]" value="f2"><input name="_Token[unlocked]" value="u2">`)
+		case r.Method == http.MethodPost && r.URL.Path == "/reservations/conf":
+			w.Header().Set("Location", "/reservations/finish/ok")
+			w.WriteHeader(http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := newTestConfig(srv.URL)
+	cfg.BurstDuration = 1
+	cfg.StartEarlySec = 3
+	client := NewPreWarmClient(cfg, numWorkers)
+	for _, w := range client.clients {
+		w.csrfToken = "ready"
+	}
+
+	burstStart := releaseTime.Add(-3 * time.Second)
+	res := client.QuickBurst(cfg.TargetDate, burstStart, releaseTime)
+	if !res.Success {
+		t.Fatalf("expected success, got: %+v", res)
+	}
+
+	// Collect first post-release timestamps and verify they cluster
+	var arrivals []time.Time
+	firstPostRelease.Range(func(_, v interface{}) bool {
+		arrivals = append(arrivals, v.(time.Time))
+		return true
+	})
+
+	if len(arrivals) < numWorkers {
+		t.Logf("warning: only %d/%d workers recorded post-release arrivals", len(arrivals), numWorkers)
+	}
+	if len(arrivals) < 2 {
+		t.Fatalf("expected at least 2 post-release arrivals, got %d", len(arrivals))
+	}
+
+	// Find the spread (max - min) of post-release arrivals
+	earliest := arrivals[0]
+	latest := arrivals[0]
+	for _, a := range arrivals[1:] {
+		if a.Before(earliest) {
+			earliest = a
+		}
+		if a.After(latest) {
+			latest = a
+		}
+	}
+	spread := latest.Sub(earliest)
+	drift := earliest.Sub(releaseTime)
+
+	t.Logf("Post-release arrivals: %d workers, spread=%v, first=%v after release",
+		len(arrivals), spread, drift)
+
+	// All workers should arrive within 200ms of each other
+	if spread > 200*time.Millisecond {
+		t.Errorf("post-release arrival spread too wide: %v (want <=200ms)", spread)
+	}
+	// First arrival should be near releaseTime (within 100ms).
+	// It can be slightly before due to busy-wait precision.
+	if drift > 100*time.Millisecond {
+		t.Errorf("first post-release arrival too late: %v after release (want <=100ms)", drift)
+	}
+	if drift < -50*time.Millisecond {
+		t.Errorf("first post-release arrival too early: %v before release (want >= -50ms)", -drift)
 	}
 }

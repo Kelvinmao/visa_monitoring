@@ -43,7 +43,8 @@ func main() {
 	}
 	log.Printf("[TRYBOOK] PreWarm done, starting burst immediately")
 
-	result := client.QuickBurst(cfg.TargetDate, time.Now())
+	// No scheduled release — pass zero releaseTime to disable synchronised snipe.
+	result := client.QuickBurst(cfg.TargetDate, time.Now(), time.Time{})
 
 	log.Printf("========================================")
 	log.Printf("RESULT:  Success=%v", result.Success)

@@ -1,119 +1,418 @@
 diff --git a/cmd/prewarm/main.go b/cmd/prewarm/main.go
-index e77449d..e1124ec 100644
+index d7bd7a0..3a589b0 100644
 --- a/cmd/prewarm/main.go
 +++ b/cmd/prewarm/main.go
-@@ -68,18 +68,32 @@ func main() {
-         keepAliveStop := make(chan struct{})
-         go client.KeepAlive(keepAliveStop)
+@@ -117,11 +117,14 @@ func main() {
+ 	}
  
--        // No clock offset calculation — just start early and let rapid retries
--        // naturally cover the opening moment. "受付期間外" rejections are fast (~100ms),
--        // so 50 workers × ~10 retries/sec = ~500 req/sec carpet-bombing the transition.
--        burstStart := releaseTime.Add(-time.Duration(cfg.StartEarlySec) * time.Second)
--        log.Printf("[MAIN] Burst scheduled at local %s (release=%s, early=%ds)",
-+        // Calibrate the server→local clock offset using a burst of HEAD samples.
-+        // HTTP Date header has 1s resolution, so multi-sample max + correction
-+        // gets us within a few hundred ms of true server time.
-+        log.Printf("[MAIN] Calibrating server clock...")
-+        booking.CalibrateServerClock(cfg.BaseURL, 30)
-+        clockOffset := booking.GetServerClockOffset()
-+        log.Printf("[MAIN] Server clock offset: %v (server is %s vs local)",
-+                clockOffset.Round(time.Millisecond),
-+                map[bool]string{true: "AHEAD", false: "BEHIND"}[clockOffset > 0])
+ 	// Now spawn QuickBurst — goroutines will sleep (not busy-wait) until burstStart
++	// Adjust releaseTime by clock offset so QuickBurst's barrier fires at the
++	// correct local instant (same adjustment applied to burstStart above).
++	adjustedRelease := releaseTime.Add(-clockOffset)
+ 	log.Printf("[MAIN] Spawning QuickBurst at %s (%.1fs before burst)",
+ 		time.Now().Format("15:04:05.000"), time.Until(burstStart).Seconds())
+ 	done := make(chan *booking.Result, 1)
+ 	go func() {
+-		done <- client.QuickBurst(cfg.TargetDate, burstStart)
++		done <- client.QuickBurst(cfg.TargetDate, burstStart, adjustedRelease)
+ 	}()
+ 
+ 	// Sleep main goroutine until burstStart
+diff --git a/cmd/trybook/main.go b/cmd/trybook/main.go
+index 941cf07..0151b92 100644
+--- a/cmd/trybook/main.go
++++ b/cmd/trybook/main.go
+@@ -43,7 +43,8 @@ func main() {
+ 	}
+ 	log.Printf("[TRYBOOK] PreWarm done, starting burst immediately")
+ 
+-	result := client.QuickBurst(cfg.TargetDate, time.Now())
++	// No scheduled release — pass zero releaseTime to disable synchronised snipe.
++	result := client.QuickBurst(cfg.TargetDate, time.Now(), time.Time{})
+ 
+ 	log.Printf("========================================")
+ 	log.Printf("RESULT:  Success=%v", result.Success)
+diff --git a/config.json b/config.json
+index b37fd43..c80a33a 100644
+--- a/config.json
++++ b/config.json
+@@ -8,7 +8,7 @@
+   "email": "kaining@layer6.ai",
+   "release_hour": 9,
+   "release_minute": 0,
+-  "start_early_sec": 30,
++  "start_early_sec": 5,
+   "burst_duration_min": 30,
+-  "worker_count": 300
++  "worker_count": 30
+ }
+diff --git a/config_account_1.json b/config_account_1.json
+index 2afba55..89166bf 100644
+--- a/config_account_1.json
++++ b/config_account_1.json
+@@ -8,7 +8,7 @@
+   "email": "kaining+account_1@layer6.ai",
+   "release_hour": 9,
+   "release_minute": 0,
+-  "start_early_sec": 30,
++  "start_early_sec": 5,
+   "burst_duration_min": 30,
+-  "worker_count": 300
++  "worker_count": 30
+ }
+diff --git a/config_account_2.json b/config_account_2.json
+index 719542c..3bd862d 100644
+--- a/config_account_2.json
++++ b/config_account_2.json
+@@ -8,7 +8,7 @@
+   "email": "kaining+account_2@layer6.ai",
+   "release_hour": 9,
+   "release_minute": 0,
+-  "start_early_sec": 30,
++  "start_early_sec": 5,
+   "burst_duration_min": 30,
+-  "worker_count": 300
++  "worker_count": 30
+ }
+diff --git a/config_account_3.json b/config_account_3.json
+index c812724..c7cde83 100644
+--- a/config_account_3.json
++++ b/config_account_3.json
+@@ -8,7 +8,7 @@
+   "email": "kaining+account_3@layer6.ai",
+   "release_hour": 9,
+   "release_minute": 0,
+-  "start_early_sec": 30,
++  "start_early_sec": 5,
+   "burst_duration_min": 30,
+-  "worker_count": 300
++  "worker_count": 30
+ }
+diff --git a/internal/booking/integration_test.go b/internal/booking/integration_test.go
+index 703af4b..aa6682d 100644
+--- a/internal/booking/integration_test.go
++++ b/internal/booking/integration_test.go
+@@ -262,7 +262,7 @@ func TestIntegration_ExtremeOneSecondWindow(t *testing.T) {
+ 	t.Logf("Expected first request arrival at server: ~%s", burstStart.Add(offset).Format("15:04:05.000"))
+ 
+ 	// Run QuickBurst
+-	result := client.QuickBurst(cfg.TargetDate, burstStart)
++	result := client.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
+ 
+ 	// Analyze results
+ 	totalOpts := atomic.LoadInt64(&mock.totalOptionReqs)
+@@ -380,7 +380,7 @@ func TestIntegration_SlotsCloseAfterOneSecond(t *testing.T) {
+ 		serverRelease.Format("15:04:05.000"), cutoffTime.Format("15:04:05.000"))
+ 	t.Logf("Burst start: %s", burstStart.Format("15:04:05.000"))
+ 
+-	result := client.QuickBurst(cfg.TargetDate, burstStart)
++	result := client.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
+ 
+ 	totalOpts := atomic.LoadInt64(&mock.totalOptionReqs)
+ 	t.Logf("Total option requests: %d", totalOpts)
+@@ -487,7 +487,7 @@ func TestIntegration_NoEarlyExitCatchesReopening(t *testing.T) {
+ 		reopenTime.Format("15:04:05.000"),
+ 		closeFinalTime.Format("15:04:05.000"))
+ 
+-	result := client.QuickBurst(cfg.TargetDate, burstStart)
++	result := client.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
+ 
+ 	reqs := atomic.LoadInt64(&optionReqs)
+ 	t.Logf("Total option requests: %d", reqs)
+@@ -780,7 +780,7 @@ func TestIntegration_CompetitiveRivalUsers(t *testing.T) {
+ 		numSlots, capacityPerSlot, numSlots*capacityPerSlot)
+ 	t.Logf("Burst start: %s (%.1fs from now)", burstStart.Format("15:04:05.000"), time.Until(burstStart).Seconds())
+ 
+-	result := client.QuickBurst(cfg.TargetDate, burstStart)
++	result := client.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
+ 
+ 	// Wait for all rivals to finish
+ 	rivalWg.Wait()
+@@ -1035,7 +1035,7 @@ func TestIntegration_CompetitiveAgainstFastBots(t *testing.T) {
+ 		numRivals, serverLatencyMs, cfg.WorkerCount)
+ 	t.Logf("Release: %s | Burst: %s", serverRelease.Format("15:04:05.000"), burstStart.Format("15:04:05.000"))
+ 
+-	result := pwClient.QuickBurst(cfg.TargetDate, burstStart)
++	result := pwClient.QuickBurst(cfg.TargetDate, burstStart, time.Time{})
+ 	rivalWg.Wait()
+ 
+ 	ours := atomic.LoadInt64(&ourBookings)
+diff --git a/internal/booking/prewarm.go b/internal/booking/prewarm.go
+index 1a30821..7bd3aa0 100644
+--- a/internal/booking/prewarm.go
++++ b/internal/booking/prewarm.go
+@@ -484,12 +484,19 @@ type firstReqProfile struct {
+ // QuickBurst fires all pre-warmed workers simultaneously.
+ // Workers are assigned dedicated slot(s) so each slot gets maximum polling frequency.
+ // burstStart: exact time when workers should start firing (goroutines sleep then busy-wait).
+-func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
++// releaseTime: the server's expected release instant. If non-zero, workers stop issuing
++// new pre-release requests 2s before release (the "freeze window"), wait at a barrier,
++// then all fire fresh requests simultaneously at releaseTime. Pre-release requests use a
++// 1.5s timeout (they only get 400s), so the 2s freeze window guarantees every in-flight
++// request completes before releaseTime. If releaseTime is zero, no snipe is used.
++func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time, releaseTime time.Time) *Result {
+ 	slots := GetTimeSlots()
+ 	results := make(chan *Result, 1)
+ 	var stopFlag int32
+ 	var wg sync.WaitGroup
+ 
++	snipeEnabled := !releaseTime.IsZero() && releaseTime.After(burstStart)
 +
-+        // burstStart is in LOCAL clock terms but anchored to SERVER release time.
-+        // If server is ahead of local by +Xs, we must fire X seconds earlier (locally)
-+        // to land at the same instant on the server.
-+        burstStart := releaseTime.
-+                Add(-time.Duration(cfg.StartEarlySec) * time.Second).
-+                Add(-clockOffset)
-+        log.Printf("[MAIN] Burst scheduled at local %s (release=%s JST, early=%ds, clock_adj=%v)",
-                 burstStart.Format("15:04:05.000"), releaseTime.Format("15:04:05"),
--                cfg.StartEarlySec)
-+                cfg.StartEarlySec, clockOffset.Round(time.Millisecond))
-         log.Printf("[MAIN] Strategy: start %ds early, rapid-retry on 受付期間外 until server opens",
-                 cfg.StartEarlySec)
+ 	var activeCount int32
+ 	for _, w := range p.clients {
+ 		if w.csrfToken != "" {
+@@ -500,6 +507,10 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
+ 		activeCount, len(slots), burstStart.Format("15:04:05.000"), p.cfg.BurstDuration)
+ 	log.Printf("[QUICKBURST] All workers fire at burstStart (rapid-retry mode, no stagger)")
+ 	log.Printf("[QUICKBURST] Time until burst: %v", time.Until(burstStart).Round(time.Millisecond))
++	if snipeEnabled {
++		log.Printf("[QUICKBURST] Release snipe at %s (barrier + synchronised fire)",
++			releaseTime.Format("15:04:05.000"))
++	}
  
--        // Stop keepalive 10 seconds before burst to let connections settle.
--        keepAliveDeadline := burstStart.Add(-10 * time.Second)
-+        // Stop keepalive 2 seconds before burst. The shorter gap keeps the TCP/TLS
-+        // connection pool hot — long idle gaps risk the server closing keep-alive
-+        // sockets, forcing fresh handshakes exactly when latency matters most.
-+        keepAliveDeadline := burstStart.Add(-2 * time.Second)
+ 	var requestCount int64
+ 	var lastLogNano int64
+@@ -508,6 +519,8 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
+ 	var status400 int64
+ 	var statusOther int64
+ 	var statusErr int64
++	var outsidePeriodSeen int64  // tracks "受付期間外" responses
++	var phaseChanged int32       // 0 = still outside period, 1 = server opened
  
-         // Wait until close to burst time.
-         for time.Now().Before(keepAliveDeadline) {
-@@ -90,11 +104,10 @@ func main() {
-                 time.Sleep(1 * time.Second)
-         }
+ 	// Track full-rotation failures for early exit.
+ 	type slotState struct {
+@@ -579,7 +592,34 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
+ 				}
  
--        // Stop keepalive now and wait for it to fully drain.
-+        // Stop keepalive now. Don't sleep — we want minimal idle time before burst.
-         close(keepAliveStop)
--        log.Printf("[MAIN] KeepAlive stopped at %s (%.1fs before burst)",
-+        log.Printf("[MAIN] KeepAlive stopped at %s (%.3fs before burst)",
-                 time.Now().Format("15:04:05.000"), time.Until(burstStart).Seconds())
--        time.Sleep(3 * time.Second) // let in-flight keepalive requests complete
+ 				pbSlot := prebuiltSlots[currentIdx%len(slots)]
+-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++				// Barrier-based synchronised snipe. The freeze window (2s)
++				// exceeds the pre-release request timeout (1.5s), so any
++				// in-flight request from the previous iteration is guaranteed
++				// to have completed before releaseTime. Workers that reach this
++				// point within the freeze window sleep+busy-wait until release.
++				const preReleaseFreezeWindow = 2 * time.Second
++				const preReleaseTimeout = 1500 * time.Millisecond
++				inPreRelease := snipeEnabled && time.Now().Before(releaseTime)
++				if inPreRelease {
++					untilRelease := time.Until(releaseTime)
++					if untilRelease > 0 && untilRelease <= preReleaseFreezeWindow {
++						// Freeze: wait until releaseTime
++						if untilRelease > time.Millisecond {
++							time.Sleep(untilRelease - time.Millisecond)
++						}
++						for time.Now().Before(releaseTime) {
++							// sub-ms busy-wait
++						}
++						inPreRelease = false // now past release
++					}
++				}
++				var reqTimeout time.Duration
++				if inPreRelease {
++					reqTimeout = preReleaseTimeout
++				} else {
++					reqTimeout = 3 * time.Second
++				}
++				ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
+ 				req, reqErr := http.NewRequestWithContext(ctx, "GET", pbSlot.optionURL, nil)
+ 				if reqErr != nil {
+ 					atomic.AddInt64(&statusErr, 1)
+@@ -610,7 +650,10 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
+ 				}
  
-         // Probe slots before burst to verify session validity
-         log.Printf("[MAIN] Probing slots to verify session...")
-diff --git a/internal/booking/booking.go b/internal/booking/booking.go
-index c54842a..a465d96 100644
---- a/internal/booking/booking.go
-+++ b/internal/booking/booking.go
-@@ -257,7 +257,9 @@ func (c *Client) Book(date, timeSlot string) *Result {
+ 				if err != nil {
+-					atomic.AddInt64(&statusErr, 1)
++					errCount := atomic.AddInt64(&statusErr, 1)
++					if errCount <= 5 || errCount%200 == 0 {
++						log.Printf("[QUICKBURST] worker=%d request error (%d total): %v", w.id, errCount, err)
++					}
+ 					cancel()
+ 					continue
+ 				}
+@@ -629,6 +672,11 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
+ 				}
  
-         log.Printf("[DEBUG] Option response status: %d", resp.StatusCode)
+ 				if resp.StatusCode == 200 {
++					if atomic.CompareAndSwapInt32(&phaseChanged, 0, 1) {
++						outsideCount := atomic.LoadInt64(&outsidePeriodSeen)
++						log.Printf("[QUICKBURST] *** SERVER OPENED *** first 200 at t+%v (after %d outside-period responses, %d total reqs)",
++							time.Since(burstStart).Round(time.Millisecond), outsideCount, count)
++					}
+ 					optBody, readErr := io.ReadAll(resp.Body)
+ 					resp.Body.Close()
+ 					cancel()
+@@ -650,6 +698,11 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
+ 					}
+ 					currentIdx++
+ 				} else if resp.StatusCode == 302 {
++					if atomic.CompareAndSwapInt32(&phaseChanged, 0, 1) {
++						outsideCount := atomic.LoadInt64(&outsidePeriodSeen)
++						log.Printf("[QUICKBURST] *** SERVER OPENED *** first 302 at t+%v (after %d outside-period responses, %d total reqs)",
++							time.Since(burstStart).Round(time.Millisecond), outsideCount, count)
++					}
+ 					location := resp.Header.Get("Location")
+ 					drainBody(resp)
+ 					cancel()
+@@ -679,6 +732,12 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
+ 					}
  
--        if resp.StatusCode != 200 && resp.StatusCode < 300 || resp.StatusCode >= 400 {
-+        // Treat anything outside 2xx/3xx as an error. 3xx is the expected
-+        // redirect path to the guest page and must NOT be classified as failure.
-+        if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-                 bodyBytes, _ := io.ReadAll(resp.Body)
-                 resp.Body.Close()
-                 log.Printf("[DEBUG] Option error response: %s", string(bodyBytes)[:min(500, len(bodyBytes))])
-diff --git a/internal/booking/helpers.go b/internal/booking/helpers.go
-index 0c5bbc8..d60b10a 100644
---- a/internal/booking/helpers.go
-+++ b/internal/booking/helpers.go
-@@ -28,8 +28,9 @@ func buildTransport() *http.Transport {
-                 MaxIdleConns:        100,
-                 MaxIdleConnsPerHost: 100,
-                 IdleConnTimeout:     60 * time.Second,
--                DisableCompression:  true,
--                ForceAttemptHTTP2:   false,
-+                // HTTP/2 multiplexes many concurrent requests over a couple of TCP
-+                // connections, dramatically lowering per-request latency under burst load.
-+                ForceAttemptHTTP2: true,
-         }
+ 					if strings.Contains(bodyStr, "上限に達した") {
++						// Log the exact moment the server transitions from "outside period" to "capacity full"
++						if atomic.CompareAndSwapInt32(&phaseChanged, 0, 1) {
++							outsideCount := atomic.LoadInt64(&outsidePeriodSeen)
++							log.Printf("[QUICKBURST] *** SERVER OPENED *** first non-受付期間外 response at t+%v (after %d outside-period responses, %d total reqs)",
++								time.Since(burstStart).Round(time.Millisecond), outsideCount, count)
++						}
+ 						slotMu.Lock()
+ 						slotStates[currentIdx%len(slots)].capacityFull++
+ 						allFull := true
+@@ -705,6 +764,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time) *Result {
+ 					}
+ 
+ 					if strings.Contains(bodyStr, "予約できません") || strings.Contains(bodyStr, "受付期間外") {
++						atomic.AddInt64(&outsidePeriodSeen, 1)
+ 						continue
+ 					}
+ 
+diff --git a/internal/booking/prewarm_test.go b/internal/booking/prewarm_test.go
+index 3318a55..610c754 100644
+--- a/internal/booking/prewarm_test.go
++++ b/internal/booking/prewarm_test.go
+@@ -108,7 +108,7 @@ func TestQuickBurstRotatesSlotsAndSucceeds(t *testing.T) {
+ 	client := NewPreWarmClient(cfg, 1)
+ 	client.clients[0].csrfToken = "ready"
+ 
+-	res := client.QuickBurst(cfg.TargetDate, time.Now())
++	res := client.QuickBurst(cfg.TargetDate, time.Now(), time.Time{})
+ 	if !res.Success {
+ 		t.Fatalf("expected success, got: %+v", res)
+ 	}
+@@ -288,7 +288,7 @@ func TestQuickBurstMultiWorkerOnlyOneResult(t *testing.T) {
+ 		w.csrfToken = "ready"
+ 	}
+ 
+-	res := client.QuickBurst(cfg.TargetDate, time.Now())
++	res := client.QuickBurst(cfg.TargetDate, time.Now(), time.Time{})
+ 	if !res.Success {
+ 		t.Fatalf("expected success with 8 workers, got: %+v", res)
+ 	}
+@@ -339,7 +339,7 @@ func TestQuickBurstNonGuestRedirectContinues(t *testing.T) {
+ 	client := NewPreWarmClient(cfg, 1)
+ 	client.clients[0].csrfToken = "ready"
+ 
+-	res := client.QuickBurst(cfg.TargetDate, time.Now())
++	res := client.QuickBurst(cfg.TargetDate, time.Now(), time.Time{})
+ 	if !res.Success {
+ 		t.Fatalf("expected success after non-guest redirects, got: %+v", res)
+ 	}
+@@ -405,3 +405,109 @@ func TestPreWarmNoCSRFReturnsError(t *testing.T) {
+ 		}
+ 	}
  }
- 
-diff --git a/internal/config/config.go b/internal/config/config.go
-index 729eca7..793482e 100644
---- a/internal/config/config.go
-+++ b/internal/config/config.go
-@@ -120,9 +120,22 @@ func (c *Config) GetTargetDateTime() time.Time {
-         return t
- }
- 
-+// releaseLocation pins the release time to JST. The target server
-+// (toronto.rsvsys.jp) operates in Asia/Tokyo, so ReleaseHour/Minute are
-+// always interpreted as JST regardless of the host's local timezone.
-+func releaseLocation() *time.Location {
-+        loc, err := time.LoadLocation("Asia/Tokyo")
-+        if err != nil {
-+                // Fallback: fixed +09:00 if tzdata is unavailable on the host.
-+                return time.FixedZone("JST", 9*3600)
-+        }
-+        return loc
++
++// ---------------------------------------------------------------------------
++// 10. Snipe barrier: workers synchronize at release time
++// ---------------------------------------------------------------------------
++func TestQuickBurstSnipeBarrierSynchronizesWorkers(t *testing.T) {
++	const numWorkers = 4
++
++	// Track the first post-release request timestamp from each worker.
++	// The mock server responds slowly (200ms) to pre-release option requests
++	// (returning 400 "受付期間外"), then quickly returns 200 after release.
++	releaseTime := time.Now().Add(3 * time.Second)
++	var firstPostRelease sync.Map // workerIdx → time.Time
++	var postReleaseCount int32
++
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch {
++		case r.Method == http.MethodGet && r.URL.Path == "/reservations/option":
++			now := time.Now()
++			if now.Before(releaseTime) {
++				// Simulate slow pre-release response
++				time.Sleep(200 * time.Millisecond)
++				w.Header().Set("Content-Type", "text/html")
++				w.WriteHeader(http.StatusBadRequest)
++				fmt.Fprint(w, `<html><title>受付期間外のため予約できません</title></html>`)
++				return
++			}
++			// Post-release: record arrival time, then return success
++			idx := atomic.AddInt32(&postReleaseCount, 1)
++			firstPostRelease.LoadOrStore(int(idx), now)
++			w.WriteHeader(http.StatusOK)
++		case r.Method == http.MethodGet && r.URL.Path == "/reservations/user/guest":
++			w.Header().Set("Content-Type", "text/html")
++			fmt.Fprint(w, `<input name="_csrfToken" value="c"><input name="_Token[fields]" value="f"><input name="_Token[unlocked]" value="u">`)
++		case r.Method == http.MethodPost && r.URL.Path == "/reservations/user/guest":
++			w.Header().Set("Location", "/reservations/conf")
++			w.WriteHeader(http.StatusFound)
++		case r.Method == http.MethodGet && r.URL.Path == "/reservations/conf":
++			w.Header().Set("Content-Type", "text/html")
++			fmt.Fprint(w, `<input name="_csrfToken" value="c2"><input name="_Token[fields]" value="f2"><input name="_Token[unlocked]" value="u2">`)
++		case r.Method == http.MethodPost && r.URL.Path == "/reservations/conf":
++			w.Header().Set("Location", "/reservations/finish/ok")
++			w.WriteHeader(http.StatusFound)
++		default:
++			w.WriteHeader(http.StatusNotFound)
++		}
++	}))
++	defer srv.Close()
++
++	cfg := newTestConfig(srv.URL)
++	cfg.BurstDuration = 1
++	cfg.StartEarlySec = 3
++	client := NewPreWarmClient(cfg, numWorkers)
++	for _, w := range client.clients {
++		w.csrfToken = "ready"
++	}
++
++	burstStart := releaseTime.Add(-3 * time.Second)
++	res := client.QuickBurst(cfg.TargetDate, burstStart, releaseTime)
++	if !res.Success {
++		t.Fatalf("expected success, got: %+v", res)
++	}
++
++	// Collect first post-release timestamps and verify they cluster
++	var arrivals []time.Time
++	firstPostRelease.Range(func(_, v interface{}) bool {
++		arrivals = append(arrivals, v.(time.Time))
++		return true
++	})
++
++	if len(arrivals) < numWorkers {
++		t.Logf("warning: only %d/%d workers recorded post-release arrivals", len(arrivals), numWorkers)
++	}
++	if len(arrivals) < 2 {
++		t.Fatalf("expected at least 2 post-release arrivals, got %d", len(arrivals))
++	}
++
++	// Find the spread (max - min) of post-release arrivals
++	earliest := arrivals[0]
++	latest := arrivals[0]
++	for _, a := range arrivals[1:] {
++		if a.Before(earliest) {
++			earliest = a
++		}
++		if a.After(latest) {
++			latest = a
++		}
++	}
++	spread := latest.Sub(earliest)
++	drift := earliest.Sub(releaseTime)
++
++	t.Logf("Post-release arrivals: %d workers, spread=%v, first=%v after release",
++		len(arrivals), spread, drift)
++
++	// All workers should arrive within 200ms of each other
++	if spread > 200*time.Millisecond {
++		t.Errorf("post-release arrival spread too wide: %v (want <=200ms)", spread)
++	}
++	// First arrival should be near releaseTime (within 100ms).
++	// It can be slightly before due to busy-wait precision.
++	if drift > 100*time.Millisecond {
++		t.Errorf("first post-release arrival too late: %v after release (want <=100ms)", drift)
++	}
++	if drift < -50*time.Millisecond {
++		t.Errorf("first post-release arrival too early: %v before release (want >= -50ms)", -drift)
++	}
 +}
-+
- func (c *Config) GetNextReleaseTime() time.Time {
--        now := time.Now()
--        target := time.Date(now.Year(), now.Month(), now.Day(), c.ReleaseHour, c.ReleaseMinute, 0, 0, now.Location())
-+        loc := releaseLocation()
-+        now := time.Now().In(loc)
-+        target := time.Date(now.Year(), now.Month(), now.Day(), c.ReleaseHour, c.ReleaseMinute, 0, 0, loc)
-         gracePeriod := time.Duration(c.StartEarlySec+30) * time.Second
-         if now.After(target.Add(gracePeriod)) {
-                 target = target.AddDate(0, 0, 1)
