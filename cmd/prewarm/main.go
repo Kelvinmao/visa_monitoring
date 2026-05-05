@@ -87,7 +87,9 @@ func main() {
 	log.Printf("[MAIN] Strategy: start %ds early, rapid-retry on 受付期間外 until server opens",
 		cfg.StartEarlySec)
 
-	keepAliveDeadline := burstStart.Add(-1 * time.Second) // stop keepalive 1s before burst
+	// Stop keepalive 30s before burst so in-flight keepalive requests (up to
+	// 10s client timeout) are fully drained before workers start firing.
+	keepAliveDeadline := burstStart.Add(-30 * time.Second)
 
 	// Wait until close to burst time.
 	for time.Now().Before(keepAliveDeadline) {
@@ -98,15 +100,16 @@ func main() {
 		time.Sleep(1 * time.Second)
 	}
 
-	// Stop keepalive before burst. Wait briefly so keepalive does not compete
-	// with booking requests, but never let diagnostics delay the actual burst.
+	// Stop keepalive and wait up to 12s for all in-flight requests to drain.
+	// Workers use a 10s client timeout, so 12s is sufficient.
 	close(keepAliveStop)
 	select {
 	case <-keepAliveDone:
-		log.Printf("[MAIN] KeepAlive stopped at %s (%.3fs before burst)",
+		log.Printf("[MAIN] KeepAlive stopped at %s (%.1fs before burst)",
 			time.Now().Format("15:04:05.000"), time.Until(burstStart).Seconds())
-	case <-time.After(500 * time.Millisecond):
-		log.Printf("[MAIN] KeepAlive stop timed out; proceeding with burst scheduling")
+	case <-time.After(12 * time.Second):
+		log.Printf("[MAIN] KeepAlive drain timed out; proceeding (%.1fs before burst)",
+			time.Until(burstStart).Seconds())
 	}
 
 	if *probe {

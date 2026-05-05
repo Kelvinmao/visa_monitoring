@@ -485,10 +485,10 @@ type firstReqProfile struct {
 // Workers are assigned dedicated slot(s) so each slot gets maximum polling frequency.
 // burstStart: exact time when workers should start firing (goroutines sleep then busy-wait).
 // releaseTime: the server's expected release instant. If non-zero, workers stop issuing
-// new pre-release requests 2s before release (the "freeze window"), wait at a barrier,
+// new pre-release requests 4s before release (the "freeze window"), wait at a barrier,
 // then all fire fresh requests simultaneously at releaseTime. Pre-release requests use a
-// 1.5s timeout (they only get 400s), so the 2s freeze window guarantees every in-flight
-// request completes before releaseTime. If releaseTime is zero, no snipe is used.
+// 3s timeout, so the 4s freeze window guarantees every in-flight request completes
+// before releaseTime. If releaseTime is zero, no snipe is used.
 func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time, releaseTime time.Time) *Result {
 	slots := GetTimeSlots()
 	results := make(chan *Result, 1)
@@ -592,13 +592,13 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time, releaseTim
 				}
 
 				pbSlot := prebuiltSlots[currentIdx%len(slots)]
-				// Barrier-based synchronised snipe. The freeze window (2s)
-				// exceeds the pre-release request timeout (1.5s), so any
+				// Barrier-based synchronised snipe. The freeze window (4s)
+				// exceeds the pre-release request timeout (3s), so any
 				// in-flight request from the previous iteration is guaranteed
 				// to have completed before releaseTime. Workers that reach this
 				// point within the freeze window sleep+busy-wait until release.
-				const preReleaseFreezeWindow = 2 * time.Second
-				const preReleaseTimeout = 1500 * time.Millisecond
+				const preReleaseFreezeWindow = 4 * time.Second
+				const preReleaseTimeout = 3 * time.Second
 				inPreRelease := snipeEnabled && time.Now().Before(releaseTime)
 				if inPreRelease {
 					untilRelease := time.Until(releaseTime)
@@ -617,7 +617,7 @@ func (p *PreWarmClient) QuickBurst(date string, burstStart time.Time, releaseTim
 				if inPreRelease {
 					reqTimeout = preReleaseTimeout
 				} else {
-					reqTimeout = 3 * time.Second
+					reqTimeout = 8 * time.Second
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
 				req, reqErr := http.NewRequestWithContext(ctx, "GET", pbSlot.optionURL, nil)

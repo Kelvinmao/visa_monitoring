@@ -415,7 +415,9 @@ func TestQuickBurstSnipeBarrierSynchronizesWorkers(t *testing.T) {
 	// Track the first post-release request timestamp from each worker.
 	// The mock server responds slowly (200ms) to pre-release option requests
 	// (returning 400 "受付期間外"), then quickly returns 200 after release.
-	releaseTime := time.Now().Add(3 * time.Second)
+	// Start 6s early so workers fire ~1 pre-release request before the 4s
+	// freeze window kicks in (freeze starts at release - 4s).
+	releaseTime := time.Now().Add(6 * time.Second)
 	var firstPostRelease sync.Map // workerIdx → time.Time
 	var postReleaseCount int32
 
@@ -455,13 +457,13 @@ func TestQuickBurstSnipeBarrierSynchronizesWorkers(t *testing.T) {
 
 	cfg := newTestConfig(srv.URL)
 	cfg.BurstDuration = 1
-	cfg.StartEarlySec = 3
+	cfg.StartEarlySec = 6
 	client := NewPreWarmClient(cfg, numWorkers)
 	for _, w := range client.clients {
 		w.csrfToken = "ready"
 	}
 
-	burstStart := releaseTime.Add(-3 * time.Second)
+	burstStart := releaseTime.Add(-6 * time.Second)
 	res := client.QuickBurst(cfg.TargetDate, burstStart, releaseTime)
 	if !res.Success {
 		t.Fatalf("expected success, got: %+v", res)
